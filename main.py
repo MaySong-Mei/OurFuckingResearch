@@ -5,10 +5,10 @@ Main pipeline for medical image segmentation using ChatGPT patch selection and S
 
 import os
 from PIL import Image
-from patch_image import create_patch_image_v1, create_patch_image_v2
+from patch_image import create_patch_image_v1, create_patch_image_v2, create_patch_image_v3
 from chatgpt_controller import call_chatgpt_for_patches, chatgpt_supervise
 from png_to_jpg import convert_png_to_jpg
-from image_predictor import patches_to_points, predict_mask
+from image_predictor import patches_to_points, predict_mask, regions_to_points
 
 
 def run_segmentation_pipeline(
@@ -38,9 +38,9 @@ def run_segmentation_pipeline(
     print(f"Starting segmentation pipeline for: {image_path}")
     print(f"Target structure: {target_structure}\n")
 
-    # Step 1: Create patch image with grid
-    print("Step 1: Creating patch image with grid...")
-    valid_points, patch_image_path = create_patch_image_v2(image_path, 'image_with_patches.png', patch_size)
+    # Step 1: Create patch image with indexed regions
+    print("Step 1: Creating patch image with indexed regions...")
+    regions_dict, patch_image_path = create_patch_image_v3(image_path, 'image_with_indexed_regions.png')
     print()
 
     # Step 2: Call ChatGPT to select patches
@@ -62,15 +62,24 @@ def run_segmentation_pipeline(
     convert_png_to_jpg(image_path, jpg_path)
     print(f"Converted to: {jpg_path}\n")
 
-    # Step 4: Convert patches to points
-    print("Step 4: Converting patches to point coordinates...")
-    img = Image.open(image_path)
-    image_size = img.size  # (width, height)
-    input_points, input_labels = patches_to_points(
-        image_size,
+    # # Step 4: Convert patches to points
+    # print("Step 4: Converting patches to point coordinates...")
+    # img = Image.open(image_path)
+    # image_size = img.size  # (width, height)
+    # input_points, input_labels = patches_to_points(
+    #     image_size,
+    #     positive_patches,
+    #     negative_patches,
+    #     patch_size
+    # )
+    # print(f"Generated {len(input_points)} points\n")
+
+    # Step 4: Convert region indices to points
+    print("Step 4: Converting region indices to point coordinates...")
+    input_points, input_labels = regions_to_points(
+        regions_dict,
         positive_patches,
-        negative_patches,
-        patch_size
+        negative_patches
     )
     print(f"Generated {len(input_points)} points\n")
 

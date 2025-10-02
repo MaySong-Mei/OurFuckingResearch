@@ -65,7 +65,7 @@ def call_chatgpt_for_patches(
     The red lines and frames are a helpful tool for you to locate the position.
     Original image and assisted image are provided."""
 
-    user_prompt = f"Analyze this medical image and identify which patches contain {prompt}. Return the positive and negative patch sequences as JSON. Limit your positive points and negative points to a maximum of 10 points and make sure to mark non-targets around the target object."
+    user_prompt = f"Analyze this medical image and identify which patches contain {prompt}. Return the positive and negative patch sequences as JSON. Limit your positive points and negative points to a maximum of 8 points and make sure to mark non-targets around the target object."
 
 
     # Call ChatGPT

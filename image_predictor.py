@@ -107,6 +107,43 @@ def patches_to_points(image_size, positive_patches, negative_patches, patch_size
 
     return np.array(input_points), np.array(input_labels)
 
+def regions_to_points(regions_dict, positive_indices, negative_indices):
+    """
+    Convert region indices to point coordinates and labels for SAM2 using region centroids.
+
+    Args:
+        regions_dict: Dictionary from create_patch_image_v3 mapping region index to properties
+                     (must include 'centroid' key with (x, y) coordinates)
+        positive_indices: List of positive region indices
+        negative_indices: List of negative region indices
+
+    Returns:
+        input_points: Array of shape (N, 2) with point coordinates (centroid of each region)
+        input_labels: Array of shape (N,) with labels (1 for positive, 0 for negative)
+    """
+    input_points = []
+    input_labels = []
+
+    # Process positive regions
+    for region_idx in positive_indices:
+        if region_idx in regions_dict:
+            centroid = regions_dict[region_idx]['centroid']
+            input_points.append([centroid[0], centroid[1]])
+            input_labels.append(1)
+        else:
+            print(f"Warning: Positive region index {region_idx} not found in regions_dict")
+
+    # Process negative regions
+    for region_idx in negative_indices:
+        if region_idx in regions_dict:
+            centroid = regions_dict[region_idx]['centroid']
+            input_points.append([centroid[0], centroid[1]])
+            input_labels.append(0)
+        else:
+            print(f"Warning: Negative region index {region_idx} not found in regions_dict")
+
+    return np.array(input_points), np.array(input_labels)
+
 def predict_mask(image_path, input_points, input_labels, sam2_checkpoint="./sam2/checkpoints/sam2.1_hiera_large.pt", model_cfg="configs/sam2.1/sam2.1_hiera_l.yaml"):
     """
     Predict segmentation masks for an image based on input points and labels.
