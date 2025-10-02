@@ -5,7 +5,7 @@ Main pipeline for medical image segmentation using ChatGPT patch selection and S
 
 import os
 from PIL import Image
-from patch_image import create_patch_image
+from patch_image import create_patch_image_v1, create_patch_image_v2
 from chatgpt_controller import call_chatgpt_for_patches, chatgpt_supervise
 from png_to_jpg import convert_png_to_jpg
 from image_predictor import patches_to_points, predict_mask
@@ -15,7 +15,7 @@ def run_segmentation_pipeline(
     image_path,
     target_structure,
     api_key=None,
-    patch_size=64,
+    patch_size=32,
     sam2_checkpoint="./sam2/checkpoints/sam2.1_hiera_large.pt",
     model_cfg="configs/sam2.1/sam2.1_hiera_l.yaml"
 ):
@@ -40,16 +40,18 @@ def run_segmentation_pipeline(
 
     # Step 1: Create patch image with grid
     print("Step 1: Creating patch image with grid...")
-    patch_image_path = create_patch_image(image_path, 'image_with_patches.png', patch_size)
+    valid_points, patch_image_path = create_patch_image_v2(image_path, 'image_with_patches.png', patch_size)
     print()
 
     # Step 2: Call ChatGPT to select patches
     print("Step 2: Calling ChatGPT to select patches...")
+    model = "gpt-5"
     positive_patches, negative_patches = call_chatgpt_for_patches(
         image_path,
         patch_image_path,
         target_structure,
-        api_key=api_key
+        api_key=api_key,
+        model=model
     )
     print(f"Positive patches: {positive_patches}")
     print(f"Negative patches: {negative_patches}\n")
@@ -85,6 +87,61 @@ def run_segmentation_pipeline(
 
     return masks, scores, logits
 
+    # # Step 6: Save masked image for supervision
+    # print("\nStep 6: Creating masked image for supervision...")
+    # import numpy as np
+    # masked_img = Image.open(jpg_path).convert('RGB')
+    # masked_array = np.array(masked_img)
+
+    # # Overlay the best mask (highest score)
+    # best_mask = masks[0]  # SAM2 returns masks sorted by score
+    # mask_overlay = np.zeros_like(masked_array)
+    # mask_overlay[best_mask > 0] = [255, 0, 0]  # Red overlay
+
+    # # Blend the mask with the original image
+    # alpha = 0.5
+    # masked_array = (masked_array * (1 - alpha) + mask_overlay * alpha).astype(np.uint8)
+    # masked_img_result = Image.fromarray(masked_array)
+
+    # masked_image_path = jpg_path.replace('.jpg', '_masked.jpg')
+    # masked_img_result.save(masked_image_path)
+    # print(f"Saved masked image to: {masked_image_path}\n")
+
+    # # Step 7: Supervise results with ChatGPT
+    # print("Step 7: Supervising segmentation results with ChatGPT...")
+    # refined_positive_patches, refined_negative_patches = chatgpt_supervise(
+    #     masked_image_path,
+    #     jpg_path,
+    #     patch_image_path,
+    #     api_key=api_key,
+    #     model=model
+    # )
+    # print(f"Refined positive patches: {refined_positive_patches}")
+    # print(f"Refined negative patches: {refined_negative_patches}\n")
+
+    # # Step 8: Convert refined patches to points
+    # print("Step 8: Converting refined patches to point coordinates...")
+    # refined_input_points, refined_input_labels = patches_to_points(
+    #     image_size,
+    #     refined_positive_patches,
+    #     refined_negative_patches,
+    #     patch_size
+    # )
+    # print(f"Generated {len(refined_input_points)} refined points\n")
+
+    # # Step 9: Run SAM2 prediction again with refined points
+    # print("Step 9: Running SAM2 segmentation with refined points...")
+    # refined_masks, refined_scores, refined_logits = predict_mask(
+    #     jpg_path,
+    #     refined_input_points,
+    #     refined_input_labels,
+    #     sam2_checkpoint,
+    #     model_cfg
+    # )
+    # print(f"\nRefined segmentation complete! Generated {len(refined_masks)} mask(s)")
+
+    # return refined_masks, refined_scores, refined_logits
+
 
 if __name__ == "__main__":
     import argparse
@@ -93,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("image_path", help="Path to input image (PNG)")
     parser.add_argument("target", help="Target structure to segment (e.g., 'liver', 'kidney')")
     parser.add_argument("--api-key", help="OpenAI API key (optional)")
-    parser.add_argument("--patch-size", type=int, default=64, help="Patch size (default: 64)")
+    parser.add_argument("--patch-size", type=int, default=32, help="Patch size (default: 64)")
     parser.add_argument("--checkpoint", default="./sam2/checkpoints/sam2.1_hiera_large.pt", help="SAM2 checkpoint path")
     parser.add_argument("--config", default="configs/sam2.1/sam2.1_hiera_l.yaml", help="SAM2 config path")
 

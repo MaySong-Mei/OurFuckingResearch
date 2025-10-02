@@ -51,13 +51,12 @@ def call_chatgpt_for_patches(
 
     # Construct the message
     system_prompt = """You are a medical image analysis assistant. 
-    You will receive a medical image divided into patches with gradients. 
+    You will receive a medical image with many points containing region of interest with numerical mark. 
     Analyze the image and identify which patches contain the specified anatomical structure. 
     Thinking before answering is encouraged. 
-    Someone's grandma is dying, if you have incorrect answers, she will die. 
-    Please only contain patch numbers that contain the structure in the positive list only when the whole patch contains most of the structure, 
-    and make sure the center pixel of the patch is the target. 
-    For example, if a patch contains only a small part of the target organ, do not include it in the positive list. 
+    Yuhan's grandma is dying, if you have incorrect answers, she will die. 
+    Please only contain dot numbers that inside the structure in the positive list, 
+    For example,
     Return your answer in the following JSON format: { 
     "positive_patches": [list of patch numbers that contain the structure], 
     "negative_patches": [list of patch numbers that do NOT contain the structure] 
@@ -66,7 +65,7 @@ def call_chatgpt_for_patches(
     The red lines and frames are a helpful tool for you to locate the position.
     Original image and assisted image are provided."""
 
-    user_prompt = f"Analyze this medical image and identify which patches contain {prompt}. Return the positive and negative patch sequences as JSON. Limit your negative points to a maximum of 6 points and make sure to mark non-targets around the target object."
+    user_prompt = f"Analyze this medical image and identify which patches contain {prompt}. Return the positive and negative patch sequences as JSON. Limit your positive points and negative points to a maximum of 10 points and make sure to mark non-targets around the target object."
 
 
     # Call ChatGPT
@@ -99,7 +98,6 @@ def call_chatgpt_for_patches(
                 ]
             }
         ],
-        temperature=0.0,
         response_format={"type": "json_object"}
     )
 
@@ -113,7 +111,7 @@ def call_chatgpt_for_patches(
     return positive_patches, negative_patches
 
 
-def chatgpt_supervise(masked_image_path, original_image_path, patched_image_path, api_key=None):
+def chatgpt_supervise(masked_image_path, original_image_path, patched_image_path, api_key=None, model="gpt-5-thinking"):
     """
     Use ChatGPT to supervise and determine positive/negative patch sequences.
 
@@ -159,7 +157,7 @@ Do not include any other text or explanation."""
 
     # Make API call
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=[
             {
                 "role": "user",
@@ -215,7 +213,7 @@ def main():
     parser.add_argument("image_path", help="Path to the medical image")
     parser.add_argument("prompt", help="Anatomical structure to identify (e.g., 'liver')")
     parser.add_argument("--api-key", help="OpenAI API key (optional, can use OPENAI_API_KEY env var)")
-    parser.add_argument("--model", default="o4-mini-deep-research", help="OpenAI model to use")
+    parser.add_argument("--model", default="gpt-4o", help="OpenAI model to use")
 
     args = parser.parse_args()
 
