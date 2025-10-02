@@ -10,7 +10,7 @@ from typing import Tuple, List
 from openai import OpenAI
 
 
-def encode_image_to_base64(image_path: str) -> str:
+def encode_image(image_path: str) -> str:
     """Encode image file to base64 string."""
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
@@ -40,8 +40,8 @@ def call_chatgpt_for_patches(
     client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
 
     # Encode both images
-    base64_original = encode_image_to_base64(original_image_path)
-    base64_patches = encode_image_to_base64(patch_image_path)
+    base64_original = encode_image(original_image_path)
+    base64_patches = encode_image(patch_image_path)
 
     original_ext = os.path.splitext(original_image_path)[1].lower()
     patch_ext = os.path.splitext(patch_image_path)[1].lower()
@@ -109,6 +109,100 @@ def call_chatgpt_for_patches(
 
     positive_patches = result.get("positive_patches", [])
     negative_patches = result.get("negative_patches", [])
+
+    return positive_patches, negative_patches
+
+
+def chatgpt_supervise(masked_image_path, original_image_path, patched_image_path, api_key=None):
+    """
+    Use ChatGPT to supervise and determine positive/negative patch sequences.
+
+    Args:
+        masked_image_path: Path to the masked image
+        original_image_path: Path to the original image
+        patched_image_path: Path to the patched image (with numbered patches)
+        api_key: OpenAI API key (if None, reads from OPENAI_API_KEY env variable)
+
+    Returns:
+        positive_patches: List of positive patch indices
+        negative_patches: List of negative patch indices
+    """
+    if api_key is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    client = OpenAI(api_key=api_key)
+
+    # Encode images
+    masked_b64 = encode_image(masked_image_path)
+    original_b64 = encode_image(original_image_path)
+    patched_b64 = encode_image(patched_image_path)
+
+    # Create the prompt
+    prompt = """You are analyzing medical images for segmentation. You are given three images:
+1. Original image - the unmodified medical scan
+2. Masked image - showing the current segmentation mask
+3. Patched image - showing numbered patches overlaid on the image
+
+Your task is to determine which patches should be marked as POSITIVE (foreground/region of interest) and which should be marked as NEGATIVE (background).
+
+Analyze the masked image to understand what region should be segmented, then look at the patched image and identify:
+- Which patch numbers overlap with the region of interest (positive patches)
+- Which patch numbers are clearly in the background (negative patches)
+
+Respond ONLY with a JSON object in this exact format:
+{
+    "positive_patches": [list of patch numbers],
+    "negative_patches": [list of patch numbers]
+}
+
+Do not include any other text or explanation."""
+
+    # Make API call
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{original_b64}"
+                        }
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{masked_b64}"
+                        }
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{patched_b64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=500
+    )
+
+    # Parse response
+    import json
+    result_text = response.choices[0].message.content
+
+    # Extract JSON from response (in case there's extra text)
+    if "```json" in result_text:
+        result_text = result_text.split("```json")[1].split("```")[0]
+    elif "```" in result_text:
+        result_text = result_text.split("```")[1].split("```")[0]
+
+    result = json.loads(result_text.strip())
+
+    positive_patches = result["positive_patches"]
+    negative_patches = result["negative_patches"]
 
     return positive_patches, negative_patches
 

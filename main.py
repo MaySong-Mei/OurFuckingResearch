@@ -6,7 +6,7 @@ Main pipeline for medical image segmentation using ChatGPT patch selection and S
 import os
 from PIL import Image
 from patch_image import create_patch_image
-from chatgpt_patch_selector import call_chatgpt_for_patches
+from chatgpt_controller import call_chatgpt_for_patches, chatgpt_supervise
 from png_to_jpg import convert_png_to_jpg
 from image_predictor import patches_to_points, predict_mask
 
