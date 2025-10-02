@@ -6,31 +6,6 @@ import torch
 import matplotlib.pyplot as plt
 from PIL import Image
 
-# select the device for computation
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-print(f"using device: {device}")
-
-if device.type == "cuda":
-    # use bfloat16 for the entire notebook
-    torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    if torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-elif device.type == "mps":
-    print(
-        "\nSupport for MPS devices is preliminary. SAM 2 is trained with CUDA and might "
-        "give numerically different outputs and sometimes degraded performance on MPS. "
-        "See e.g. https://github.com/pytorch/pytorch/issues/84936 for a discussion."
-    )
-
-np.random.seed(3)
-
 def show_mask(mask, ax, random_color=False, borders = True):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
@@ -148,6 +123,32 @@ def predict_mask(image_path, input_points, input_labels, sam2_checkpoint="./sam2
         scores: Confidence scores for each mask
         logits: Raw logits from the model
     """
+
+    # select the device for computation
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"using device: {device}")
+
+    if device.type == "cuda":
+        # use bfloat16 for the entire notebook
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+        if torch.cuda.get_device_properties(0).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    elif device.type == "mps":
+        print(
+            "\nSupport for MPS devices is preliminary. SAM 2 is trained with CUDA and might "
+            "give numerically different outputs and sometimes degraded performance on MPS. "
+            "See e.g. https://github.com/pytorch/pytorch/issues/84936 for a discussion."
+        )
+
+    np.random.seed(3)
+
     # Load image
     image = Image.open(image_path)
     image = np.array(image.convert("RGB"))
@@ -165,24 +166,26 @@ def predict_mask(image_path, input_points, input_labels, sam2_checkpoint="./sam2
         multimask_output=False,
     )
 
-    # Sort by scores
+    # Sort by scores (highest first)
     sorted_ind = np.argsort(scores)[::-1]
     masks = masks[sorted_ind]
     scores = scores[sorted_ind]
     logits = logits[sorted_ind]
 
-    # Visualize and save
-    show_masks(image, masks, scores, point_coords=np.array(input_points), input_labels=np.array(input_labels), borders=True)
+    print(f"Generated {len(masks)} masks with scores: {scores}")
+
+    # Visualize and save - only show the best mask
+    show_masks(image, masks[:1], scores[:1], point_coords=np.array(input_points), input_labels=np.array(input_labels), borders=True)
 
     return masks, scores, logits
 
-# Example usage
-if __name__ == "__main__":
-    image_path = 'image.jpg'
-    positive_patches = [8, 12, 20]  # Example positive patch indices
-    negative_patches = [28, 36]       # Example negative patch indices
-    image = Image.open(image_path)
-    image_size = image.size  # (width, height)
-    input_points, input_labels = patches_to_points(image_size, positive_patches, negative_patches)
+# # Example usage
+# if __name__ == "__main__":
+#     image_path = 'image.jpg'
+#     positive_patches = [2, 3, 10, 11, 18]  # Example positive patch indices
+#     negative_patches = [1, 4, 5, 12, 19, 27]       # Example negative patch indices
+#     image = Image.open(image_path)
+#     image_size = image.size  # (width, height)
+#     input_points, input_labels = patches_to_points(image_size, positive_patches, negative_patches)
 
-    masks, scores, logits = predict_mask(image_path, input_points, input_labels)
+#     masks, scores, logits = predict_mask(image_path, input_points, input_labels)
