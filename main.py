@@ -45,7 +45,7 @@ def run_segmentation_pipeline(
 
     # Step 2: Call ChatGPT to select patches
     print("Step 2: Calling ChatGPT to select patches...")
-    model = "gpt-5"
+    model = "gpt-4o"
     positive_patches, negative_patches = call_chatgpt_for_patches(
         image_path,
         patch_image_path,
