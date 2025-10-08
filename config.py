@@ -24,9 +24,15 @@ class Config:
     interpolation_method: str = "rife"  # "rife", "film", or "simple"
 
     # Model settings
-    segmentation_model: str = "unet"  # "unet", "attention_unet", "nnunet"
+    segmentation_model: str = "unet"  # "unet", "attention_unet", "medsam"
     segmentation_checkpoint: Optional[str] = None
     freeze_segmentation: bool = True
+
+    # MedSAM settings
+    use_medsam: bool = False
+    medsam_checkpoint: Optional[str] = None  # Path to MedSAM checkpoint
+    medsam_model_type: str = "vit_b"  # "vit_b", "vit_l", "vit_h"
+    medsam_auto_download: bool = False  # Auto-download checkpoint if not found
 
     # Training settings
     batch_size: int = 2  # Small batch size due to 3D volume memory
@@ -230,6 +236,22 @@ def get_high_quality_config() -> Config:
         lambda_smoothness=0.2,
         lambda_reconstruction=2.0,
         mixed_precision=True,
+        use_wandb=True
+    )
+
+
+def get_medsam_config() -> Config:
+    """Get configuration using MedSAM for segmentation"""
+    return Config(
+        use_medsam=True,
+        medsam_checkpoint="checkpoints/medsam_vit_b.pth",
+        medsam_model_type="vit_b",
+        medsam_auto_download=True,
+        batch_size=2,
+        num_epochs=100,
+        num_slices=16,
+        img_size=(256, 256),
+        lambda_consistency=1.5,
         use_wandb=True
     )
 

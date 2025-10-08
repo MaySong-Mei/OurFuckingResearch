@@ -18,6 +18,7 @@ from datetime import datetime
 from data_loader import MedicalVolumeDataset
 from models.rife_interpolator import RIFEInterpolator
 from models.unet_segmentation import UNetSegmentation
+from models.medsam_segmentation import MedSAMSegmentation, load_medsam
 from utils.multi_view import MultiViewExtractor
 from losses import ConsistencyLoss, SmoothnessLoss, ReconstructionLoss
 from config import Config
@@ -40,10 +41,33 @@ class TrainingPipeline:
         ).to(self.device)
 
         # Load frozen segmentation model
-        self.segmentation = UNetSegmentation(
-            in_channels=config.in_channels,
-            num_classes=config.num_classes
-        ).to(self.device)
+        if config.use_medsam:
+            logger.info("Using MedSAM for segmentation")
+            self.segmentation = load_medsam(
+                checkpoint_path=config.medsam_checkpoint,
+                model_type=config.medsam_model_type,
+                device=str(self.device),
+                num_classes=config.num_classes,
+                auto_download=config.medsam_auto_download
+            )
+        else:
+            logger.info("Using U-Net for segmentation")
+            self.segmentation = UNetSegmentation(
+                in_channels=config.in_channels,
+                num_classes=config.num_classes
+            ).to(self.device)
+
+            # Load checkpoint if provided
+            if config.segmentation_checkpoint:
+                logger.info(f"Loading segmentation checkpoint: {config.segmentation_checkpoint}")
+                checkpoint = torch.load(config.segmentation_checkpoint, map_location=self.device)
+                if 'model_state_dict' in checkpoint:
+                    self.segmentation.load_state_dict(checkpoint['model_state_dict'])
+                elif 'state_dict' in checkpoint:
+                    self.segmentation.load_state_dict(checkpoint['state_dict'])
+                else:
+                    self.segmentation.load_state_dict(checkpoint)
+
         self.segmentation.eval()
         for param in self.segmentation.parameters():
             param.requires_grad = False

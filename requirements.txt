@@ -31,6 +31,11 @@ pyyaml>=6.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 
+# MedSAM / Segment Anything Model
+# Install from git repository:
+# pip install git+https://github.com/facebookresearch/segment-anything.git
+segment-anything
+
 # Development tools
 pytest>=7.3.0
 black>=23.3.0
