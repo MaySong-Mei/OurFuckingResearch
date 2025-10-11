@@ -16,7 +16,7 @@ import wandb
 from datetime import datetime
 
 from data_loader import MedicalVolumeDataset
-from models.rife_interpolator import RIFEInterpolator
+from models.IFNet import IFNet
 from models.unet_segmentation import UNetSegmentation
 from models.medsam_segmentation import MedSAMSegmentation, load_medsam
 from utils.multi_view import MultiViewExtractor
@@ -36,9 +36,7 @@ class TrainingPipeline:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize models
-        self.interpolator = RIFEInterpolator(
-            scale=config.interpolation_factor
-        ).to(self.device)
+        self.interpolator = IFNet().to(self.device)
 
         # Load frozen segmentation model
         if config.use_medsam:
@@ -131,7 +129,7 @@ class TrainingPipeline:
 
     def interpolate_volume(self, slices: torch.Tensor) -> torch.Tensor:
         """
-        Interpolate between slices to create denser volume
+        Interpolate between slices to create denser volume using IFNet
 
         Args:
             slices: [B, N, H, W] - batch of N original slices
@@ -149,9 +147,23 @@ class TrainingPipeline:
             frame0 = slices[:, i:i+1]  # [B, 1, H, W]
             frame1 = slices[:, i+1:i+2]  # [B, 1, H, W]
 
+            # IFNet expects [B, 6, H, W] input (concatenated RGB images)
+            # Convert grayscale to 3-channel by repeating
+            frame0_rgb = frame0.repeat(1, 3, 1, 1)  # [B, 3, H, W]
+            frame1_rgb = frame1.repeat(1, 3, 1, 1)  # [B, 3, H, W]
+
+            # Concatenate along channel dimension
+            ifnet_input = torch.cat([frame0_rgb, frame1_rgb], dim=1)  # [B, 6, H, W]
+
             # Interpolate middle frame(s)
             with torch.set_grad_enabled(self.training):
-                middle_frame = self.interpolator(frame0, frame1)
+                # IFNet returns: (flow_list, mask, merged, flow_teacher, merged_teacher, loss_distill)
+                # merged is a list of 3 frames, merged[2] is the final refined output
+                _, _, merged, _, _, _ = self.interpolator(ifnet_input)
+                middle_frame_rgb = merged[2]  # [B, 3, H, W]
+
+                # Convert back to grayscale by averaging channels
+                middle_frame = middle_frame_rgb.mean(dim=1, keepdim=True)  # [B, 1, H, W]
 
             interpolated_slices.append(middle_frame)
             interpolated_slices.append(frame1)
