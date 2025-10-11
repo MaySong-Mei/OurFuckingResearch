@@ -15,7 +15,7 @@ from tqdm import tqdm
 import wandb
 from datetime import datetime
 
-from data_loader import MedicalVolumeDataset
+from data_loader import MedicalVolumeDataset, SimpleDICOMDataset
 from models.IFNet import IFNet
 from models.unet_segmentation import UNetSegmentation
 from models.medsam_segmentation import MedSAMSegmentation, load_medsam
@@ -112,12 +112,24 @@ class TrainingPipeline:
 
     def _create_data_loader(self, split: str) -> DataLoader:
         """Create data loader for train/val split"""
-        dataset = MedicalVolumeDataset(
-            data_dir=self.config.data_dir,
-            split=split,
-            transform=self.config.transform,
-            cache_data=self.config.cache_data
-        )
+        if self.config.single_file_mode:
+            # Use SimpleDICOMDataset for single file
+            # In single file mode, we use the same file for train and val
+            dataset = SimpleDICOMDataset(
+                dicom_path=self.config.single_dicom_path,
+                num_slices=self.config.num_slices,
+                img_size=self.config.img_size,
+                transform=self.config.transform,
+                normalize=True
+            )
+        else:
+            # Use MedicalVolumeDataset for multiple files
+            dataset = MedicalVolumeDataset(
+                data_dir=self.config.data_dir,
+                split=split,
+                transform=self.config.transform,
+                cache_data=self.config.cache_data
+            )
 
         return DataLoader(
             dataset,
@@ -140,7 +152,7 @@ class TrainingPipeline:
         batch_size, num_slices, H, W = slices.shape
 
         # For 2x interpolation: N' = 2*N - 1
-        interpolated_slices = [slices[:, 0]]
+        interpolated_slices = [slices[:, 0:1]]  # Keep dimension [B, 1, H, W]
 
         for i in range(num_slices - 1):
             # Get consecutive slice pairs
@@ -156,10 +168,10 @@ class TrainingPipeline:
             ifnet_input = torch.cat([frame0_rgb, frame1_rgb], dim=1)  # [B, 6, H, W]
 
             # Interpolate middle frame(s)
-            with torch.set_grad_enabled(self.training):
+            with torch.set_grad_enabled(self.interpolator.training):
                 # IFNet returns: (flow_list, mask, merged, flow_teacher, merged_teacher, loss_distill)
                 # merged is a list of 3 frames, merged[2] is the final refined output
-                _, _, merged, _, _, _ = self.interpolator(ifnet_input)
+                _, _, merged = self.interpolator(ifnet_input)
                 middle_frame_rgb = merged[2]  # [B, 3, H, W]
 
                 # Convert back to grayscale by averaging channels
@@ -420,7 +432,167 @@ class TrainingPipeline:
 
 def main():
     """Entry point"""
-    config = Config()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Train 3D Medical Image Interpolation')
+
+    # Single file mode
+    parser.add_argument('--single_file', type=str, default=None,
+                       help='Path to single DICOM file for training (enables single file mode)')
+
+    # Data settings
+    parser.add_argument('--data_dir', type=str, default='./data',
+                       help='Data directory (ignored in single file mode)')
+    parser.add_argument('--num_slices', type=int, default=16,
+                       help='Number of slices to extract')
+    parser.add_argument('--img_size', type=int, default=256,
+                       help='Image size (square)')
+
+    # Training settings
+    parser.add_argument('--batch_size', type=int, default=2,
+                       help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=100,
+                       help='Number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                       help='Learning rate')
+
+    # Loss weights
+    parser.add_argument('--lambda_consistency', type=float, default=1.0,
+                       help='Consistency loss weight')
+    parser.add_argument('--lambda_smoothness', type=float, default=0.1,
+                       help='Smoothness loss weight')
+    parser.add_argument('--lambda_reconstruction', type=float, default=1.0,
+                       help='Reconstruction loss weight')
+
+    # Checkpointing
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                       help='Checkpoint directory')
+    parser.add_argument('--resume_from', type=str, default=None,
+                       help='Resume from checkpoint')
+
+    # Segmentation
+    parser.add_argument('--use_medsam', action='store_true',
+                       help='Use MedSAM for segmentation')
+    parser.add_argument('--segmentation_checkpoint', type=str, default=None,
+                       help='Path to segmentation checkpoint')
+
+    # Logging
+    parser.add_argument('--use_wandb', action='store_true',
+                       help='Enable wandb logging')
+    parser.add_argument('--project_name', type=str, default='medical-interpolation',
+                       help='Wandb project name')
+
+    # Hardware
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device (cuda/cpu)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers')
+
+    args = parser.parse_args()
+
+    # Create config based on single file mode or not
+    if args.single_file:
+        logger.info(f"Running in SINGLE FILE MODE with: {args.single_file}")
+        config = Config(
+            # Single file mode
+            single_file_mode=True,
+            single_dicom_path=args.single_file,
+            data_dir=".",
+
+            # Data settings
+            num_slices=args.num_slices,
+            img_size=(args.img_size, args.img_size),
+
+            # Training settings
+            batch_size=1,  # Force batch_size=1 for single file
+            num_epochs=args.num_epochs,
+            learning_rate=args.learning_rate,
+            num_workers=0,  # Force 0 workers for single file
+
+            # Loss weights
+            lambda_consistency=args.lambda_consistency,
+            lambda_smoothness=args.lambda_smoothness,
+            lambda_reconstruction=args.lambda_reconstruction,
+
+            # Checkpointing
+            checkpoint_dir=args.checkpoint_dir,
+            resume_from=args.resume_from,
+
+            # Segmentation
+            use_medsam=args.use_medsam,
+            segmentation_checkpoint=args.segmentation_checkpoint,
+
+            # Logging
+            use_wandb=args.use_wandb,
+            project_name=args.project_name,
+            log_interval=1,  # Log every step for single file
+
+            # Hardware
+            device=args.device,
+            cache_data=False,
+        )
+    else:
+        logger.info("Running in NORMAL MODE with dataset directory")
+        config = Config(
+            # Normal mode
+            single_file_mode=False,
+            data_dir=args.data_dir,
+
+            # Data settings
+            num_slices=args.num_slices,
+            img_size=(args.img_size, args.img_size),
+
+            # Training settings
+            batch_size=args.batch_size,
+            num_epochs=args.num_epochs,
+            learning_rate=args.learning_rate,
+            num_workers=args.num_workers,
+
+            # Loss weights
+            lambda_consistency=args.lambda_consistency,
+            lambda_smoothness=args.lambda_smoothness,
+            lambda_reconstruction=args.lambda_reconstruction,
+
+            # Checkpointing
+            checkpoint_dir=args.checkpoint_dir,
+            resume_from=args.resume_from,
+
+            # Segmentation
+            use_medsam=args.use_medsam,
+            segmentation_checkpoint=args.segmentation_checkpoint,
+
+            # Logging
+            use_wandb=args.use_wandb,
+            project_name=args.project_name,
+
+            # Hardware
+            device=args.device,
+        )
+
+    # Check CUDA availability
+    if config.device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA not available, falling back to CPU")
+        config.device = "cpu"
+
+    # Print config summary
+    logger.info("=" * 80)
+    logger.info("Training Configuration:")
+    logger.info("=" * 80)
+    if config.single_file_mode:
+        logger.info(f"Mode: Single File")
+        logger.info(f"DICOM file: {config.single_dicom_path}")
+    else:
+        logger.info(f"Mode: Dataset Directory")
+        logger.info(f"Data directory: {config.data_dir}")
+    logger.info(f"Number of slices: {config.num_slices}")
+    logger.info(f"Image size: {config.img_size}")
+    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"Number of epochs: {config.num_epochs}")
+    logger.info(f"Learning rate: {config.learning_rate}")
+    logger.info(f"Device: {config.device}")
+    logger.info("=" * 80)
+
+    # Create and run pipeline
     pipeline = TrainingPipeline(config)
     pipeline.train()
 

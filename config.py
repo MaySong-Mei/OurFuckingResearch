@@ -14,6 +14,8 @@ class Config:
     # Data settings
     data_dir: str = "./data"
     split_file: Optional[str] = None
+    single_file_mode: bool = False  # Use a single DICOM file for training/testing
+    single_dicom_path: Optional[str] = None  # Path to single DICOM file
     num_slices: int = 16
     img_size: tuple = (256, 256)
     in_channels: int = 1
@@ -90,8 +92,14 @@ class Config:
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
         # Validate paths
-        if self.data_dir and not Path(self.data_dir).exists():
-            raise ValueError(f"Data directory does not exist: {self.data_dir}")
+        if self.single_file_mode:
+            if not self.single_dicom_path:
+                raise ValueError("single_dicom_path must be specified when single_file_mode=True")
+            if not Path(self.single_dicom_path).exists():
+                raise ValueError(f"Single DICOM file does not exist: {self.single_dicom_path}")
+        else:
+            if self.data_dir and not Path(self.data_dir).exists():
+                raise ValueError(f"Data directory does not exist: {self.data_dir}")
 
         # Validate parameters
         if self.interpolation_factor < 2:

@@ -6,3 +6,5 @@ __pycache__/
 
 *.dcm
 segmented_output/
+
+checkpoints/
