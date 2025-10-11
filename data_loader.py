@@ -226,6 +226,150 @@ class MedicalVolumeDataset(Dataset):
         return slices
 
 
+class SimpleDICOMDataset(Dataset):
+    """Simple dataset for testing with a single DICOM file"""
+
+    def __init__(
+        self,
+        dicom_path: str,
+        num_slices: int = 16,
+        img_size: Tuple[int, int] = (256, 256),
+        transform=None,
+        normalize: bool = True
+    ):
+        """
+        Args:
+            dicom_path: Path to a single DICOM file
+            num_slices: Number of slices to extract from the volume
+            img_size: Target size for each slice (H, W)
+            transform: Optional transforms to apply
+            normalize: Whether to normalize intensity values
+        """
+        self.dicom_path = Path(dicom_path)
+        self.num_slices = num_slices
+        self.img_size = img_size
+        self.transform = transform
+        self.normalize = normalize
+
+        if not self.dicom_path.exists():
+            raise FileNotFoundError(f"DICOM file not found: {dicom_path}")
+
+        logger.info(f"Initialized SimpleDICOMDataset with {dicom_path}")
+
+    def __len__(self) -> int:
+        return 1  # Single volume, but we can treat it as multiple samples for testing
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get the single volume"""
+        # Load DICOM file
+        volume = self._load_dicom(self.dicom_path)
+
+        # Preprocess
+        if self.normalize:
+            volume = self._normalize_intensity(volume)
+
+        if volume.shape[-2:] != self.img_size:
+            volume = self._resize_volume(volume, self.img_size)
+
+        # Extract slices
+        slices = self._extract_slices(volume)
+
+        # Convert to tensor
+        slices_tensor = torch.from_numpy(slices).float()
+
+        # Apply transforms
+        if self.transform is not None:
+            slices_tensor = self.transform(slices_tensor)
+
+        sample = {
+            'slices': slices_tensor,
+            'file_path': str(self.dicom_path),
+            'volume_shape': volume.shape
+        }
+
+        return sample
+
+    def _load_dicom(self, file_path: Path) -> np.ndarray:
+        """Load DICOM file and extract 3D volume"""
+        try:
+            dicom_data = pydicom.dcmread(str(file_path))
+
+            # Extract pixel array
+            if hasattr(dicom_data, 'pixel_array'):
+                volume = dicom_data.pixel_array
+
+                # Handle different DICOM formats
+                if len(volume.shape) == 2:
+                    # Single slice - create volume by replicating
+                    logger.warning(f"Single slice detected, replicating to {self.num_slices} slices")
+                    volume = np.stack([volume] * self.num_slices, axis=0)
+                elif len(volume.shape) == 3:
+                    # Already 3D - perfect
+                    logger.info(f"3D volume loaded: shape {volume.shape}")
+                elif len(volume.shape) == 4:
+                    # Multi-frame with time - take first timepoint
+                    logger.warning(f"4D volume detected, taking first timepoint")
+                    volume = volume[0]
+
+                return volume.astype(np.float32)
+            else:
+                raise ValueError(f"No pixel array found in DICOM: {file_path}")
+
+        except Exception as e:
+            logger.error(f"Error loading DICOM {file_path}: {e}")
+            raise
+
+    def _normalize_intensity(self, volume: np.ndarray) -> np.ndarray:
+        """Normalize intensity values to [0, 1]"""
+        # Clip outliers using percentiles
+        p1, p99 = np.percentile(volume, [1, 99])
+        volume = np.clip(volume, p1, p99)
+
+        # Normalize to [0, 1]
+        vol_min = volume.min()
+        vol_max = volume.max()
+
+        if vol_max > vol_min:
+            volume = (volume - vol_min) / (vol_max - vol_min)
+        else:
+            volume = volume - vol_min
+
+        return volume
+
+    def _resize_volume(self, volume: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+        """Resize volume to target spatial dimensions"""
+        if len(volume.shape) == 3:
+            num_slices, H, W = volume.shape
+            zoom_factors = (1.0, target_size[0] / H, target_size[1] / W)
+        elif len(volume.shape) == 2:
+            H, W = volume.shape
+            zoom_factors = (target_size[0] / H, target_size[1] / W)
+        else:
+            raise ValueError(f"Unexpected volume shape: {volume.shape}")
+
+        resized = zoom(volume, zoom_factors, order=1)
+        return resized
+
+    def _extract_slices(self, volume: np.ndarray) -> np.ndarray:
+        """Extract N slices from volume"""
+        if len(volume.shape) == 2:
+            # Single slice - replicate
+            return np.stack([volume] * self.num_slices, axis=0)
+
+        num_slices_available = volume.shape[0]
+
+        if num_slices_available >= self.num_slices:
+            # Uniformly sample slices
+            indices = np.linspace(0, num_slices_available - 1, self.num_slices, dtype=int)
+            slices = volume[indices]
+        else:
+            # Pad with zeros if not enough slices
+            slices = np.zeros((self.num_slices, *self.img_size), dtype=np.float32)
+            slices[:num_slices_available] = volume
+
+        return slices
+
+
 class DICOMSeriesDataset(Dataset):
     """Dataset for loading complete DICOM series (multiple files per volume)"""
 
