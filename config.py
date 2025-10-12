@@ -16,7 +16,7 @@ class Config:
     split_file: Optional[str] = None
     single_file_mode: bool = False  # Use a single DICOM file for training/testing
     single_dicom_path: Optional[str] = None  # Path to single DICOM file
-    num_slices: int = 16
+    num_slices: int = 129  # Number of slices to sample (will be interpolated to 256)
     img_size: tuple = (256, 256)
     in_channels: int = 1
     num_classes: int = 2  # Background + foreground (adjust for multi-class)
@@ -26,9 +26,14 @@ class Config:
     interpolation_method: str = "rife"  # "rife", "film", or "simple"
 
     # Model settings
-    segmentation_model: str = "unet"  # "unet", "attention_unet", "medsam"
+    segmentation_model: str = "vit"  # "unet", "attention_unet", "medsam", "vit"
     segmentation_checkpoint: Optional[str] = None
     freeze_segmentation: bool = True
+
+    # Vision Transformer (TransUNet) settings
+    vit_name: str = "ViT-B_16"  # "ViT-B_16", "ViT-B_32", "ViT-L_16", "R50-ViT-B_16", etc.
+    vit_patches_size: int = 16  # Patch size for ViT
+    n_skip: int = 3  # Number of skip connections (0-3)
 
     # MedSAM settings
     use_medsam: bool = False

@@ -14,11 +14,12 @@ import logging
 from tqdm import tqdm
 import wandb
 from datetime import datetime
+import numpy as np
 
 from data_loader import MedicalVolumeDataset, SimpleDICOMDataset
 from models.IFNet import IFNet
-from models.unet_segmentation import UNetSegmentation
-from models.medsam_segmentation import MedSAMSegmentation, load_medsam
+from models.vit_seg_modeling import VisionTransformer as ViT_seg
+from models.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from utils.multi_view import MultiViewExtractor
 from losses import ConsistencyLoss, SmoothnessLoss, ReconstructionLoss
 from config import Config
@@ -38,33 +39,56 @@ class TrainingPipeline:
         # Initialize models
         self.interpolator = IFNet().to(self.device)
 
-        # Load frozen segmentation model
-        if config.use_medsam:
-            logger.info("Using MedSAM for segmentation")
-            self.segmentation = load_medsam(
-                checkpoint_path=config.medsam_checkpoint,
-                model_type=config.medsam_model_type,
-                device=str(self.device),
-                num_classes=config.num_classes,
-                auto_download=config.medsam_auto_download
-            )
-        else:
-            logger.info("Using U-Net for segmentation")
-            self.segmentation = UNetSegmentation(
-                in_channels=config.in_channels,
-                num_classes=config.num_classes
-            ).to(self.device)
+        # Load frozen segmentation model using TransUNet's ViT_seg
+        logger.info("Using Vision Transformer (TransUNet) for segmentation")
 
-            # Load checkpoint if provided
-            if config.segmentation_checkpoint:
-                logger.info(f"Loading segmentation checkpoint: {config.segmentation_checkpoint}")
-                checkpoint = torch.load(config.segmentation_checkpoint, map_location=self.device)
-                if 'model_state_dict' in checkpoint:
-                    self.segmentation.load_state_dict(checkpoint['model_state_dict'])
-                elif 'state_dict' in checkpoint:
-                    self.segmentation.load_state_dict(checkpoint['state_dict'])
-                else:
-                    self.segmentation.load_state_dict(checkpoint)
+        # Get the ViT configuration
+        vit_name = config.vit_name if hasattr(config, 'vit_name') else 'ViT-B_16'
+        config_vit = CONFIGS_ViT_seg[vit_name]
+        config_vit.n_classes = config.num_classes
+
+        # Set n_skip if provided (default to 3 for skip connections)
+        if not hasattr(config_vit, 'n_skip'):
+            config_vit.n_skip = config.n_skip if hasattr(config, 'n_skip') else 3
+
+        # Set patch size
+        vit_patches_size = config.vit_patches_size if hasattr(config, 'vit_patches_size') else 16
+        config_vit.patches.size = (vit_patches_size, vit_patches_size)
+
+        # Handle ResNet hybrid models
+        if vit_name.find('R50') != -1:
+            config_vit.patches.grid = (
+                int(config.img_size[0] / vit_patches_size),
+                int(config.img_size[1] / vit_patches_size)
+            )
+            # Add skip_channels for ResNet hybrid models
+            if not hasattr(config_vit, 'skip_channels'):
+                config_vit.skip_channels = [512, 256, 64, 16]
+        else:
+            # For non-ResNet models, ensure skip_channels exists (set to zeros)
+            if not hasattr(config_vit, 'skip_channels'):
+                config_vit.skip_channels = [0, 0, 0, 0]
+
+        # Initialize the model
+        self.segmentation = ViT_seg(
+            config_vit,
+            img_size=config.img_size[0],  # Assumes square images
+            num_classes=config_vit.n_classes
+        ).to(self.device)
+
+        # Load pretrained ImageNet weights from config_vit.pretrained_path
+        import os
+        if hasattr(config_vit, 'pretrained_path') and config_vit.pretrained_path:
+            pretrained_path = config_vit.pretrained_path
+            logger.info(f"Loading pretrained ViT weights from: {pretrained_path}")
+            if os.path.exists(pretrained_path):
+                self.segmentation.load_from(weights=np.load(pretrained_path))
+                logger.info("Pretrained ViT weights loaded successfully")
+            else:
+                logger.warning(f"Pretrained weights file not found: {pretrained_path}")
+                logger.warning("Continuing with randomly initialized weights")
+        else:
+            logger.info("No pretrained weights specified, using random initialization")
 
         self.segmentation.eval()
         for param in self.segmentation.parameters():
@@ -142,15 +166,17 @@ class TrainingPipeline:
     def interpolate_volume(self, slices: torch.Tensor) -> torch.Tensor:
         """
         Interpolate between slices to create denser volume using IFNet
+        Takes 129 slices and interpolates to 256 slices
 
         Args:
-            slices: [B, N, H, W] - batch of N original slices
+            slices: [B, 129, H, W] - batch of 129 original slices
 
         Returns:
-            interpolated: [B, N', H, W] - batch of N' interpolated slices
+            interpolated: [B, 256, H, W] - batch of 256 interpolated slices
         """
         batch_size, num_slices, H, W = slices.shape
 
+        # First use IFNet to do 2x interpolation: 129 -> 257 slices
         # For 2x interpolation: N' = 2*N - 1
         interpolated_slices = [slices[:, 0:1]]  # Keep dimension [B, 1, H, W]
 
@@ -180,8 +206,11 @@ class TrainingPipeline:
             interpolated_slices.append(middle_frame)
             interpolated_slices.append(frame1)
 
-        # Stack all slices
-        interpolated = torch.cat(interpolated_slices, dim=1)
+        # Stack all slices: 129 -> 257 slices
+        interpolated = torch.cat(interpolated_slices, dim=1)  # [B, 257, H, W]
+
+        # Drop the last frame to get exactly 256 slices
+        interpolated = interpolated[:, :256, :, :]  # [B, 256, H, W]
 
         return interpolated
 
@@ -202,6 +231,12 @@ class TrainingPipeline:
         sagittal_slices = volume.permute(0, 2, 1, 3)  # [B, H, N', W]
         coronal_slices = volume.permute(0, 3, 1, 2)  # [B, W, N', H]
 
+        # Debug logging
+        logger.info(f"Volume shape: {volume.shape}")
+        logger.info(f"Axial slices shape: {axial_slices.shape}")
+        logger.info(f"Sagittal slices shape: {sagittal_slices.shape}")
+        logger.info(f"Coronal slices shape: {coronal_slices.shape}")
+
         # Segment each view
         with torch.no_grad():
             seg_axial = self._segment_slices(axial_slices)
@@ -212,25 +247,49 @@ class TrainingPipeline:
 
     def _segment_slices(self, slices: torch.Tensor) -> torch.Tensor:
         """
-        Segment a batch of slices
+        Segment a batch of slices using TransUNet's ViT_seg
+        Handles interpolation if slices are not 256x256
 
         Args:
-            slices: [B, N, H, W]
+            slices: [B, N, H, W] - grayscale slices
 
         Returns:
-            segmentations: [B, N, H, W, C]
+            segmentations: [B, N, H, W, C] - class probabilities/logits
         """
         B, N, H, W = slices.shape
+        expected_size = self.config.img_size[0]  # 256
+
+        # Debug logging
+        logger.debug(f"_segment_slices input shape: [B={B}, N={N}, H={H}, W={W}]")
 
         # Reshape to process all slices at once
-        slices_flat = slices.view(B * N, 1, H, W)
+        slices_flat = slices.view(B * N, 1, H, W)  # [B*N, 1, H, W]
 
-        # Segment
-        seg_flat = self.segmentation(slices_flat)  # [B*N, C, H, W]
+        # If spatial dimensions don't match expected size, resize
+        if H != expected_size or W != expected_size:
+            logger.debug(f"Resizing from {H}x{W} to {expected_size}x{expected_size}")
+            slices_flat = torch.nn.functional.interpolate(
+                slices_flat,
+                size=(expected_size, expected_size),
+                mode='bilinear',
+                align_corners=False
+            )  # [B*N, 1, expected_size, expected_size]
+
+        # Segment - ViT_seg automatically converts 1-channel to 3-channel
+        seg_flat = self.segmentation(slices_flat)  # [B*N, num_classes, expected_size, expected_size]
+
+        # Resize back to original spatial dimensions if needed
+        if H != expected_size or W != expected_size:
+            seg_flat = torch.nn.functional.interpolate(
+                seg_flat,
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False
+            )  # [B*N, num_classes, H, W]
 
         # Reshape back
         C = seg_flat.shape[1]
-        segmentations = seg_flat.view(B, N, C, H, W)
+        segmentations = seg_flat.view(B, N, C, H, W)  # [B, N, C, H, W]
         segmentations = segmentations.permute(0, 1, 3, 4, 2)  # [B, N, H, W, C]
 
         return segmentations
@@ -443,8 +502,8 @@ def main():
     # Data settings
     parser.add_argument('--data_dir', type=str, default='./data',
                        help='Data directory (ignored in single file mode)')
-    parser.add_argument('--num_slices', type=int, default=16,
-                       help='Number of slices to extract')
+    parser.add_argument('--num_slices', type=int, default=129,
+                       help='Number of slices to extract (will be interpolated to 256)')
     parser.add_argument('--img_size', type=int, default=256,
                        help='Image size (square)')
 

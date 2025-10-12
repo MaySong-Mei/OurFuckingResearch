@@ -8,3 +8,4 @@ __pycache__/
 segmented_output/
 
 checkpoints/
+segmentation_checkpoint/
