@@ -2,18 +2,8 @@
 Utility modules
 """
 
-from .multi_view import (
-    MultiViewExtractor,
-    VolumeInterpolator,
-    VolumeVisualizer,
-    calculate_dice_score,
-    calculate_consistency_metrics
-)
+from .multi_view import MultiViewExtractor
 
 __all__ = [
     'MultiViewExtractor',
-    'VolumeInterpolator',
-    'VolumeVisualizer',
-    'calculate_dice_score',
-    'calculate_consistency_metrics'
 ]

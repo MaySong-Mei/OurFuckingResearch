@@ -21,7 +21,7 @@ from models.IFNet import IFNet
 from models.vit_seg_modeling import VisionTransformer as ViT_seg
 from models.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from utils.multi_view import MultiViewExtractor
-from losses import ConsistencyLoss, SmoothnessLoss, ReconstructionLoss
+from losses import ConsistencyLoss, SmoothnessLoss
 from config import Config
 
 
@@ -97,12 +97,11 @@ class TrainingPipeline:
         # Multi-view extractor
         self.multi_view_extractor = MultiViewExtractor()
 
-        # Loss functions
+        # Loss functions (self-supervised: multi-view consistency based)
         self.consistency_loss = ConsistencyLoss(
             loss_type=config.consistency_loss_type
         )
         self.smoothness_loss = SmoothnessLoss()
-        self.reconstruction_loss = ReconstructionLoss()
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -280,6 +279,7 @@ class TrainingPipeline:
 
         # Resize back to original spatial dimensions if needed
         if H != expected_size or W != expected_size:
+            logger.debug(f"Resizing segmentation back to {H}x{W}")
             seg_flat = torch.nn.functional.interpolate(
                 seg_flat,
                 size=(H, W),
@@ -295,14 +295,13 @@ class TrainingPipeline:
         return segmentations
 
     def compute_loss(self, seg_axial, seg_sagittal, seg_coronal,
-                     interpolated_volume, original_slices):
+                     interpolated_volume):
         """
-        Compute total training loss
+        Compute total self-supervised training loss from multi-view consistency
 
         Args:
             seg_axial, seg_sagittal, seg_coronal: Segmentations from different views
             interpolated_volume: Interpolated volume
-            original_slices: Original input slices
 
         Returns:
             loss: Total loss
@@ -312,22 +311,18 @@ class TrainingPipeline:
         seg_sagittal_remapped = seg_sagittal.permute(0, 2, 1, 3, 4)  # [B, N', H, W, C]
         seg_coronal_remapped = seg_coronal.permute(0, 2, 3, 1, 4)   # [B, N', H, W, C]
 
-        # Consistency losses
+        # Multi-view consistency losses (primary self-supervised signal)
         consistency_sag = self.consistency_loss(seg_axial, seg_sagittal_remapped)
         consistency_cor = self.consistency_loss(seg_axial, seg_coronal_remapped)
         consistency_total = (consistency_sag + consistency_cor) / 2
 
-        # Smoothness loss on interpolated volume
+        # Smoothness regularization
         smoothness = self.smoothness_loss(interpolated_volume)
-
-        # Reconstruction loss (preserve original slices)
-        reconstruction = self.reconstruction_loss(interpolated_volume, original_slices)
 
         # Total weighted loss
         total_loss = (
             self.config.lambda_consistency * consistency_total +
-            self.config.lambda_smoothness * smoothness +
-            self.config.lambda_reconstruction * reconstruction
+            self.config.lambda_smoothness * smoothness
         )
 
         loss_dict = {
@@ -335,8 +330,7 @@ class TrainingPipeline:
             'consistency': consistency_total.item(),
             'consistency_sagittal': consistency_sag.item(),
             'consistency_coronal': consistency_cor.item(),
-            'smoothness': smoothness.item(),
-            'reconstruction': reconstruction.item()
+            'smoothness': smoothness.item()
         }
 
         return total_loss, loss_dict
@@ -364,7 +358,7 @@ class TrainingPipeline:
             # 3. Compute losses
             loss, loss_dict = self.compute_loss(
                 seg_axial, seg_sagittal, seg_coronal,
-                interpolated_volume, slices
+                interpolated_volume
             )
 
             # Backward pass
@@ -414,7 +408,7 @@ class TrainingPipeline:
 
             loss, loss_dict = self.compute_loss(
                 seg_axial, seg_sagittal, seg_coronal,
-                interpolated_volume, slices
+                interpolated_volume
             )
 
             val_losses.append(loss_dict)
@@ -515,13 +509,11 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate')
 
-    # Loss weights
+    # Loss weights (self-supervised: no ground truth required)
     parser.add_argument('--lambda_consistency', type=float, default=1.0,
-                       help='Consistency loss weight')
+                       help='Multi-view consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1,
-                       help='Smoothness loss weight')
-    parser.add_argument('--lambda_reconstruction', type=float, default=1.0,
-                       help='Reconstruction loss weight')
+                       help='Smoothness regularization weight')
 
     # Checkpointing
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
@@ -571,7 +563,6 @@ def main():
             # Loss weights
             lambda_consistency=args.lambda_consistency,
             lambda_smoothness=args.lambda_smoothness,
-            lambda_reconstruction=args.lambda_reconstruction,
 
             # Checkpointing
             checkpoint_dir=args.checkpoint_dir,
@@ -610,7 +601,6 @@ def main():
             # Loss weights
             lambda_consistency=args.lambda_consistency,
             lambda_smoothness=args.lambda_smoothness,
-            lambda_reconstruction=args.lambda_reconstruction,
 
             # Checkpointing
             checkpoint_dir=args.checkpoint_dir,
@@ -649,6 +639,7 @@ def main():
     logger.info(f"Number of epochs: {config.num_epochs}")
     logger.info(f"Learning rate: {config.learning_rate}")
     logger.info(f"Device: {config.device}")
+    logger.info(f"Interpolator backbone: IFNet")
     logger.info("=" * 80)
 
     # Create and run pipeline

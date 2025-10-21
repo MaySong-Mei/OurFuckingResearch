@@ -100,16 +100,15 @@ From the interpolated volume of N' × H × W voxels, extract:
 
 **Training Objective**: Maximize multi-view segmentation consistency
 
-**Loss Function**:
+**Loss Function** (self-supervised, no ground truth required):
 ```
-L_total = λ₁ * L_consistency + λ₂ * L_smoothness + λ₃ * L_reconstruction
+L_total = λ₁ * L_consistency + λ₂ * L_smoothness
 ```
 
 Where:
-- **L_consistency**: Measures agreement between segmentation results across views
-  - Can use Dice loss, focal loss, or custom consistency metrics
-- **L_smoothness**: Ensures smooth transitions in interpolated slices
-- **L_reconstruction**: Optional term for preserving original slice information
+- **L_consistency**: Measures agreement between segmentation results across views (primary self-supervised signal)
+  - Can use Dice loss, cross-entropy, or custom consistency metrics
+- **L_smoothness**: Regularization to ensure smooth transitions in interpolated slices
 
 **Optimization Strategy**:
 - Only the interpolation network parameters are updated
@@ -133,7 +132,7 @@ Where:
 
 ### Hyperparameters
 - Interpolation factor (determines N')
-- Loss weight coefficients (λ₁, λ₂, λ₃)
+- Loss weight coefficients (λ₁ for consistency, λ₂ for smoothness)
 - Learning rate and optimization schedule
 - Batch size (limited by 3D volume memory requirements)
 
