@@ -22,18 +22,19 @@ from models.vit_seg_modeling import VisionTransformer as ViT_seg
 from models.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from utils.multi_view import MultiViewExtractor
 from losses import ConsistencyLoss, SmoothnessLoss
-from config import Config
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+
+
 class TrainingPipeline:
     """Main training pipeline for self-supervised 3D interpolation"""
 
-    def __init__(self, config: Config):
-        self.config = config
+    def __init__(self, args):
+        self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize models
@@ -43,23 +44,23 @@ class TrainingPipeline:
         logger.info("Using Vision Transformer (TransUNet) for segmentation")
 
         # Get the ViT configuration
-        vit_name = config.vit_name if hasattr(config, 'vit_name') else 'ViT-B_16'
+        vit_name = self.args.vit_name
         config_vit = CONFIGS_ViT_seg[vit_name]
-        config_vit.n_classes = config.num_classes
+        config_vit.n_classes = self.args.num_classes
 
         # Set n_skip if provided (default to 3 for skip connections)
         if not hasattr(config_vit, 'n_skip'):
-            config_vit.n_skip = config.n_skip if hasattr(config, 'n_skip') else 3
+            config_vit.n_skip = self.args.n_skip
 
         # Set patch size
-        vit_patches_size = config.vit_patches_size if hasattr(config, 'vit_patches_size') else 16
+        vit_patches_size = self.args.vit_patches_size
         config_vit.patches.size = (vit_patches_size, vit_patches_size)
 
         # Handle ResNet hybrid models
         if vit_name.find('R50') != -1:
             config_vit.patches.grid = (
-                int(config.img_size[0] / vit_patches_size),
-                int(config.img_size[1] / vit_patches_size)
+                int(self.args.img_size[0] / vit_patches_size),
+                int(self.args.img_size[1] / vit_patches_size)
             )
             # Add skip_channels for ResNet hybrid models
             if not hasattr(config_vit, 'skip_channels'):
@@ -72,7 +73,7 @@ class TrainingPipeline:
         # Initialize the model
         self.segmentation = ViT_seg(
             config_vit,
-            img_size=config.img_size[0],  # Assumes square images
+            img_size=self.args.img_size[0],  # Assumes square images
             num_classes=config_vit.n_classes
         ).to(self.device)
 
@@ -99,22 +100,22 @@ class TrainingPipeline:
 
         # Loss functions (self-supervised: multi-view consistency based)
         self.consistency_loss = ConsistencyLoss(
-            loss_type=config.consistency_loss_type
+            loss_type=self.args.consistency_loss_type
         )
         self.smoothness_loss = SmoothnessLoss()
 
         # Optimizer
         self.optimizer = optim.Adam(
             self.interpolator.parameters(),
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2)
+            lr=self.args.learning_rate,
+            betas=(self.args.beta1, self.args.beta2)
         )
 
         # Scheduler
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=config.num_epochs,
-            eta_min=config.min_lr
+            T_max=self.args.num_epochs,
+            eta_min=self.args.min_lr
         )
 
         # Data loaders
@@ -126,39 +127,39 @@ class TrainingPipeline:
         self.global_step = 0
 
         # Setup logging
-        if config.use_wandb:
+        if self.args.use_wandb:
             wandb.init(
-                project=config.project_name,
-                config=vars(config),
+                project=self.args.project_name,
+                config=vars(self.args),
                 name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             )
 
     def _create_data_loader(self, split: str) -> DataLoader:
         """Create data loader for train/val split"""
-        if self.config.single_file_mode:
+        if self.args.single_file_mode:
             # Use SimpleDICOMDataset for single file
             # In single file mode, we use the same file for train and val
             dataset = SimpleDICOMDataset(
-                dicom_path=self.config.single_dicom_path,
-                num_slices=self.config.num_slices,
-                img_size=self.config.img_size,
-                transform=self.config.transform,
+                dicom_path=self.args.single_dicom_path,
+                num_slices=self.args.num_slices,
+                img_size=self.args.img_size,
                 normalize=True
             )
         else:
             # Use MedicalVolumeDataset for multiple files
             dataset = MedicalVolumeDataset(
-                data_dir=self.config.data_dir,
+                data_dir=self.args.data_dir,
                 split=split,
-                transform=self.config.transform,
-                cache_data=self.config.cache_data
+                num_slices=self.args.num_slices,
+                img_size=self.args.img_size,
+                cache_data=self.args.cache_data
             )
 
         return DataLoader(
             dataset,
-            batch_size=self.config.batch_size,
+            batch_size=self.args.batch_size,
             shuffle=(split == 'train'),
-            num_workers=self.config.num_workers,
+            num_workers=self.args.num_workers,
             pin_memory=True
         )
 
@@ -256,13 +257,13 @@ class TrainingPipeline:
             segmentations: [B, N, H, W, C] - class probabilities/logits
         """
         B, N, H, W = slices.shape
-        expected_size = self.config.img_size[0]  # 256
+        expected_size = self.args.img_size[0]  # 256
 
         # Debug logging
         logger.debug(f"_segment_slices input shape: [B={B}, N={N}, H={H}, W={W}]")
 
         # Reshape to process all slices at once
-        slices_flat = slices.view(B * N, 1, H, W)  # [B*N, 1, H, W]
+        slices_flat = slices.reshape(B * N, 1, H, W)  # [B*N, 1, H, W]
 
         # If spatial dimensions don't match expected size, resize
         if H != expected_size or W != expected_size:
@@ -289,7 +290,7 @@ class TrainingPipeline:
 
         # Reshape back
         C = seg_flat.shape[1]
-        segmentations = seg_flat.view(B, N, C, H, W)  # [B, N, C, H, W]
+        segmentations = seg_flat.reshape(B, N, C, H, W)  # [B, N, C, H, W]
         segmentations = segmentations.permute(0, 1, 3, 4, 2)  # [B, N, H, W, C]
 
         return segmentations
@@ -321,8 +322,8 @@ class TrainingPipeline:
 
         # Total weighted loss
         total_loss = (
-            self.config.lambda_consistency * consistency_total +
-            self.config.lambda_smoothness * smoothness
+            self.args.lambda_consistency * consistency_total +
+            self.args.lambda_smoothness * smoothness
         )
 
         loss_dict = {
@@ -341,7 +342,7 @@ class TrainingPipeline:
 
         epoch_losses = []
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.config.num_epochs}')
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.num_epochs}')
         for batch_idx, batch in enumerate(pbar):
             slices = batch['slices'].to(self.device)  # [B, N, H, W]
 
@@ -365,10 +366,10 @@ class TrainingPipeline:
             loss.backward()
 
             # Gradient clipping
-            if self.config.grad_clip > 0:
+            if self.args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.interpolator.parameters(),
-                    self.config.grad_clip
+                    self.args.grad_clip
                 )
 
             self.optimizer.step()
@@ -377,7 +378,7 @@ class TrainingPipeline:
             epoch_losses.append(loss_dict)
             pbar.set_postfix({'loss': f"{loss_dict['total']:.4f}"})
 
-            if self.config.use_wandb and self.global_step % self.config.log_interval == 0:
+            if self.args.use_wandb and self.global_step % self.args.log_interval == 0:
                 wandb.log({f'train/{k}': v for k, v in loss_dict.items()},
                          step=self.global_step)
 
@@ -419,7 +420,7 @@ class TrainingPipeline:
             for k in val_losses[0].keys()
         }
 
-        if self.config.use_wandb:
+        if self.args.use_wandb:
             wandb.log({f'val/{k}': v for k, v in avg_val_loss.items()},
                      step=self.global_step)
 
@@ -434,23 +435,23 @@ class TrainingPipeline:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'val_loss': val_loss,
-            'config': vars(self.config)
+            'config': vars(self.args)
         }
 
         # Save latest
-        save_path = Path(self.config.checkpoint_dir) / 'latest.pth'
+        save_path = Path(self.args.checkpoint_dir) / 'latest.pth'
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, save_path)
 
         # Save best
         if is_best:
-            best_path = Path(self.config.checkpoint_dir) / 'best.pth'
+            best_path = Path(self.args.checkpoint_dir) / 'best.pth'
             torch.save(checkpoint, best_path)
             logger.info(f"Saved best model with val_loss: {val_loss:.4f}")
 
         # Save periodic
-        if epoch % self.config.save_interval == 0:
-            epoch_path = Path(self.config.checkpoint_dir) / f'epoch_{epoch}.pth'
+        if epoch % self.args.save_interval == 0:
+            epoch_path = Path(self.args.checkpoint_dir) / f'epoch_{epoch}.pth'
             torch.save(checkpoint, epoch_path)
 
     def train(self):
@@ -459,7 +460,7 @@ class TrainingPipeline:
         logger.info(f"Training samples: {len(self.train_loader.dataset)}")
         logger.info(f"Validation samples: {len(self.val_loader.dataset)}")
 
-        for epoch in range(1, self.config.num_epochs + 1):
+        for epoch in range(1, self.args.num_epochs + 1):
             # Train
             train_loss = self.train_epoch(epoch)
             logger.info(f"Epoch {epoch} - Train Loss: {train_loss['total']:.4f}")
@@ -479,7 +480,7 @@ class TrainingPipeline:
             self.save_checkpoint(epoch, val_loss['total'], is_best)
 
         logger.info("Training complete!")
-        if self.config.use_wandb:
+        if self.args.use_wandb:
             wandb.finish()
 
 
@@ -494,7 +495,7 @@ def main():
                        help='Path to single DICOM file for training (enables single file mode)')
 
     # Data settings
-    parser.add_argument('--data_dir', type=str, default='./data',
+    parser.add_argument('--data_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/data',
                        help='Data directory (ignored in single file mode)')
     parser.add_argument('--num_slices', type=int, default=129,
                        help='Number of slices to extract (will be interpolated to 256)')
@@ -509,25 +510,43 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate')
 
-    # Loss weights (self-supervised: no ground truth required)
+    # Model
+    parser.add_argument('--num_classes', type=int, default=2,
+                       help='Number of classes')
+    parser.add_argument('--vit_name', type=str, default='ViT-B_16',
+                       help='ViT model name')
+    parser.add_argument('--vit_patches_size', type=int, default=16,
+                       help='ViT patch size')
+    parser.add_argument('--n_skip', type=int, default=3,
+                       help='Number of skip connections')
+
+    # Training parameters
+    parser.add_argument('--min_lr', type=float, default=1e-6,
+                       help='Minimum learning rate')
+    parser.add_argument('--beta1', type=float, default=0.9,
+                       help='Adam beta1')
+    parser.add_argument('--beta2', type=float, default=0.999,
+                       help='Adam beta2')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                       help='Gradient clipping value')
+
+    # Loss weights
     parser.add_argument('--lambda_consistency', type=float, default=1.0,
                        help='Multi-view consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1,
                        help='Smoothness regularization weight')
+    parser.add_argument('--consistency_loss_type', type=str, default='dice',
+                       help='Consistency loss type')
 
     # Checkpointing
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
                        help='Checkpoint directory')
-    parser.add_argument('--resume_from', type=str, default=None,
-                       help='Resume from checkpoint')
-
-    # Segmentation
-    parser.add_argument('--use_medsam', action='store_true',
-                       help='Use MedSAM for segmentation')
-    parser.add_argument('--segmentation_checkpoint', type=str, default=None,
-                       help='Path to segmentation checkpoint')
+    parser.add_argument('--save_interval', type=int, default=10,
+                       help='Save checkpoint interval')
 
     # Logging
+    parser.add_argument('--log_interval', type=int, default=10,
+                       help='Logging interval')
     parser.add_argument('--use_wandb', action='store_true',
                        help='Enable wandb logging')
     parser.add_argument('--project_name', type=str, default='medical-interpolation',
@@ -536,114 +555,56 @@ def main():
     # Hardware
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device (cuda/cpu)')
+    parser.add_argument('--cache_data', action='store_true',
+                       help='Cache preprocessed data')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
 
     args = parser.parse_args()
 
-    # Create config based on single file mode or not
+    # Convert img_size from int to tuple
+    args.img_size = (args.img_size, args.img_size)
+
+    # Handle single file mode
     if args.single_file:
         logger.info(f"Running in SINGLE FILE MODE with: {args.single_file}")
-        config = Config(
-            # Single file mode
-            single_file_mode=True,
-            single_dicom_path=args.single_file,
-            data_dir=".",
-
-            # Data settings
-            num_slices=args.num_slices,
-            img_size=(args.img_size, args.img_size),
-
-            # Training settings
-            batch_size=1,  # Force batch_size=1 for single file
-            num_epochs=args.num_epochs,
-            learning_rate=args.learning_rate,
-            num_workers=0,  # Force 0 workers for single file
-
-            # Loss weights
-            lambda_consistency=args.lambda_consistency,
-            lambda_smoothness=args.lambda_smoothness,
-
-            # Checkpointing
-            checkpoint_dir=args.checkpoint_dir,
-            resume_from=args.resume_from,
-
-            # Segmentation
-            use_medsam=args.use_medsam,
-            segmentation_checkpoint=args.segmentation_checkpoint,
-
-            # Logging
-            use_wandb=args.use_wandb,
-            project_name=args.project_name,
-            log_interval=1,  # Log every step for single file
-
-            # Hardware
-            device=args.device,
-            cache_data=False,
-        )
+        args.single_file_mode = True
+        args.single_dicom_path = args.single_file
+        args.data_dir = "."
+        args.batch_size = 1
+        args.num_workers = 0
+        args.log_interval = 1
     else:
         logger.info("Running in NORMAL MODE with dataset directory")
-        config = Config(
-            # Normal mode
-            single_file_mode=False,
-            data_dir=args.data_dir,
-
-            # Data settings
-            num_slices=args.num_slices,
-            img_size=(args.img_size, args.img_size),
-
-            # Training settings
-            batch_size=args.batch_size,
-            num_epochs=args.num_epochs,
-            learning_rate=args.learning_rate,
-            num_workers=args.num_workers,
-
-            # Loss weights
-            lambda_consistency=args.lambda_consistency,
-            lambda_smoothness=args.lambda_smoothness,
-
-            # Checkpointing
-            checkpoint_dir=args.checkpoint_dir,
-            resume_from=args.resume_from,
-
-            # Segmentation
-            use_medsam=args.use_medsam,
-            segmentation_checkpoint=args.segmentation_checkpoint,
-
-            # Logging
-            use_wandb=args.use_wandb,
-            project_name=args.project_name,
-
-            # Hardware
-            device=args.device,
-        )
+        args.single_file_mode = False
+        args.single_dicom_path = None
 
     # Check CUDA availability
-    if config.device == "cuda" and not torch.cuda.is_available():
+    if args.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA not available, falling back to CPU")
-        config.device = "cpu"
+        args.device = "cpu"
 
     # Print config summary
     logger.info("=" * 80)
     logger.info("Training Configuration:")
     logger.info("=" * 80)
-    if config.single_file_mode:
+    if args.single_file_mode:
         logger.info(f"Mode: Single File")
-        logger.info(f"DICOM file: {config.single_dicom_path}")
+        logger.info(f"DICOM file: {args.single_dicom_path}")
     else:
         logger.info(f"Mode: Dataset Directory")
-        logger.info(f"Data directory: {config.data_dir}")
-    logger.info(f"Number of slices: {config.num_slices}")
-    logger.info(f"Image size: {config.img_size}")
-    logger.info(f"Batch size: {config.batch_size}")
-    logger.info(f"Number of epochs: {config.num_epochs}")
-    logger.info(f"Learning rate: {config.learning_rate}")
-    logger.info(f"Device: {config.device}")
+        logger.info(f"Data directory: {args.data_dir}")
+    logger.info(f"Number of slices: {args.num_slices}")
+    logger.info(f"Image size: {args.img_size}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Number of epochs: {args.num_epochs}")
+    logger.info(f"Learning rate: {args.learning_rate}")
+    logger.info(f"Device: {args.device}")
     logger.info(f"Interpolator backbone: IFNet")
     logger.info("=" * 80)
 
     # Create and run pipeline
-    pipeline = TrainingPipeline(config)
+    pipeline = TrainingPipeline(args)
     pipeline.train()
 
 
