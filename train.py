@@ -284,7 +284,10 @@ class TrainingPipeline:
                 align_corners=False
             )  # [B*N, 1, expected_size, expected_size]
 
-        # Segment - ViT_seg automatically converts 1-channel to 3-channel
+        # Convert grayscale to 3-channel by repeating
+        slices_flat = slices_flat.repeat(1, 3, 1, 1)  # [B*N, 3, expected_size, expected_size]
+
+        # Segment - ViT_seg expects 3-channel RGB input
         seg_flat = self.segmentation(slices_flat)  # [B*N, num_classes, expected_size, expected_size]
 
         # Resize back to original spatial dimensions if needed
@@ -323,8 +326,9 @@ class TrainingPipeline:
         seg_coronal_remapped = seg_coronal.permute(0, 2, 3, 1, 4)   # [B, N', H, W, C]
 
         # Multi-view consistency losses (self-supervised signal)
-        consistency_sag = self.consistency_loss(seg_axial, seg_sagittal_remapped)
-        consistency_cor = self.consistency_loss(seg_axial, seg_coronal_remapped)
+        is_first_batch = getattr(self, '_is_first_batch', False)
+        consistency_sag = self.consistency_loss(seg_axial, seg_sagittal_remapped, debug=is_first_batch)
+        consistency_cor = self.consistency_loss(seg_axial, seg_coronal_remapped, debug=is_first_batch)
         consistency_total = (consistency_sag + consistency_cor) / 2
 
         # Smoothness regularization

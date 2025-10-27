@@ -23,37 +23,39 @@ class ConsistencyLoss(nn.Module):
         self.loss_type = loss_type
         self.weight = weight
 
-    def forward(self, pred1: torch.Tensor, pred2: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred1: torch.Tensor, pred2: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         Compute consistency loss between two predictions
 
         Args:
             pred1: [B, N, H, W, C] - first prediction
             pred2: [B, N, H, W, C] - second prediction
+            debug: Whether to print debug information
 
         Returns:
             loss: Scalar consistency loss
         """
         if self.loss_type == 'dice':
-            return self.dice_loss(pred1, pred2)
+            return self.dice_loss(pred1, pred2, debug=debug)
         elif self.loss_type == 'ce':
-            return self.cross_entropy_loss(pred1, pred2)
+            return self.cross_entropy_loss(pred1, pred2, debug=debug)
         elif self.loss_type == 'mse':
-            return self.mse_loss(pred1, pred2)
+            return self.mse_loss(pred1, pred2, debug=debug)
         elif self.loss_type == 'combined':
-            dice = self.dice_loss(pred1, pred2)
-            ce = self.cross_entropy_loss(pred1, pred2)
+            dice = self.dice_loss(pred1, pred2, debug=debug)
+            ce = self.cross_entropy_loss(pred1, pred2, debug=debug)
             return 0.5 * dice + 0.5 * ce
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
-    def dice_loss(self, pred1: torch.Tensor, pred2: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    def dice_loss(self, pred1: torch.Tensor, pred2: torch.Tensor, smooth: float = 1e-6, debug: bool = False) -> torch.Tensor:
         """
         Dice loss between two predictions
 
         Args:
             pred1, pred2: [B, N, H, W, C] predictions
             smooth: Smoothing factor
+            debug: Whether to print debug information
 
         Returns:
             loss: 1 - Dice coefficient
@@ -61,6 +63,12 @@ class ConsistencyLoss(nn.Module):
         # Apply softmax to get probabilities
         pred1_prob = F.softmax(pred1, dim=-1)
         pred2_prob = F.softmax(pred2, dim=-1)
+
+        if debug:
+            print(f"\n=== Dice Loss Debug ===")
+            print(f"pred1 shape: {pred1.shape}")
+            print(f"pred1_prob - Min: {pred1_prob.min():.6f}, Max: {pred1_prob.max():.6f}, Mean: {pred1_prob.mean():.6f}")
+            print(f"pred2_prob - Min: {pred2_prob.min():.6f}, Max: {pred2_prob.max():.6f}, Mean: {pred2_prob.mean():.6f}")
 
         # Flatten spatial dimensions
         pred1_flat = pred1_prob.reshape(-1, pred1.shape[-1])
@@ -74,15 +82,22 @@ class ConsistencyLoss(nn.Module):
         # Dice coefficient
         dice = (2.0 * intersection + smooth) / (pred1_sum + pred2_sum + smooth)
 
+        if debug:
+            print(f"Dice per class: {dice}")
+            print(f"Dice mean: {dice.mean():.6f}")
+            print(f"Loss (1 - dice): {(1.0 - dice.mean()).item():.6f}")
+            print(f"======================\n")
+
         # Return loss (1 - dice)
         return 1.0 - dice.mean()
 
-    def cross_entropy_loss(self, pred1: torch.Tensor, pred2: torch.Tensor) -> torch.Tensor:
+    def cross_entropy_loss(self, pred1: torch.Tensor, pred2: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         Symmetric cross-entropy loss between predictions
 
         Args:
             pred1, pred2: [B, N, H, W, C] predictions
+            debug: Whether to print debug information
 
         Returns:
             loss: Symmetric CE loss
@@ -99,14 +114,23 @@ class ConsistencyLoss(nn.Module):
         loss1 = -(pred2_prob * pred1_log).sum(dim=-1).mean()
         loss2 = -(pred1_prob * pred2_log).sum(dim=-1).mean()
 
+        if debug:
+            print(f"\n=== Cross Entropy Loss Debug ===")
+            print(f"pred1 shape: {pred1.shape}")
+            print(f"KL(pred2||pred1): {loss1.item():.6f}")
+            print(f"KL(pred1||pred2): {loss2.item():.6f}")
+            print(f"Symmetric CE: {0.5 * (loss1 + loss2).item():.6f}")
+            print(f"================================\n")
+
         return 0.5 * (loss1 + loss2)
 
-    def mse_loss(self, pred1: torch.Tensor, pred2: torch.Tensor) -> torch.Tensor:
+    def mse_loss(self, pred1: torch.Tensor, pred2: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         MSE loss between predictions
 
         Args:
             pred1, pred2: [B, N, H, W, C] predictions
+            debug: Whether to print debug information
 
         Returns:
             loss: MSE between predictions
@@ -114,7 +138,15 @@ class ConsistencyLoss(nn.Module):
         pred1_prob = F.softmax(pred1, dim=-1)
         pred2_prob = F.softmax(pred2, dim=-1)
 
-        return F.mse_loss(pred1_prob, pred2_prob)
+        mse = F.mse_loss(pred1_prob, pred2_prob)
+
+        if debug:
+            print(f"\n=== MSE Loss Debug ===")
+            print(f"pred1 shape: {pred1.shape}")
+            print(f"MSE: {mse.item():.6f}")
+            print(f"====================\n")
+
+        return mse
 
 
 class SmoothnessLoss(nn.Module):
