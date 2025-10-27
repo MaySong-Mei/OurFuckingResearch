@@ -15,6 +15,9 @@ from tqdm import tqdm
 import wandb
 from datetime import datetime
 import numpy as np
+from PIL import Image
+import pydicom
+from scipy.ndimage import zoom
 
 from data_loader import MedicalVolumeDataset, SimpleDICOMDataset
 from models.IFNet import IFNet
@@ -296,13 +299,13 @@ class TrainingPipeline:
         return segmentations
 
     def compute_loss(self, seg_axial, seg_sagittal, seg_coronal,
-                     interpolated_volume):
+                     interpolated_volume, original_slices):
         """
-        Compute total self-supervised training loss from multi-view consistency
+        Compute total training loss from multi-view consistency
 
         Args:
             seg_axial, seg_sagittal, seg_coronal: Segmentations from different views
-            interpolated_volume: Interpolated volume
+            interpolated_volume: Interpolated volume [B, 256, H, W]
 
         Returns:
             loss: Total loss
@@ -312,7 +315,7 @@ class TrainingPipeline:
         seg_sagittal_remapped = seg_sagittal.permute(0, 2, 1, 3, 4)  # [B, N', H, W, C]
         seg_coronal_remapped = seg_coronal.permute(0, 2, 3, 1, 4)   # [B, N', H, W, C]
 
-        # Multi-view consistency losses (primary self-supervised signal)
+        # Multi-view consistency losses (self-supervised signal)
         consistency_sag = self.consistency_loss(seg_axial, seg_sagittal_remapped)
         consistency_cor = self.consistency_loss(seg_axial, seg_coronal_remapped)
         consistency_total = (consistency_sag + consistency_cor) / 2
@@ -483,6 +486,137 @@ class TrainingPipeline:
         if self.args.use_wandb:
             wandb.finish()
 
+    def _load_full_volume_slices(self, file_path: str, num_output_slices: int = 257) -> np.ndarray:
+        """
+        Load all slices from a DICOM/npy file and return exactly num_output_slices
+        by linearly sampling across the full volume.
+
+        Args:
+            file_path: Path to DICOM or npy file
+            num_output_slices: Number of slices to extract (default 257 for 0-256)
+
+        Returns:
+            slices: [num_output_slices, H, W] normalized slices
+        """
+        file_path = Path(file_path)
+
+        # Load volume
+        if file_path.suffix == '.dcm':
+            dicom_data = pydicom.dcmread(str(file_path))
+            volume = dicom_data.pixel_array.astype(np.float32)
+        elif file_path.suffix == '.npy':
+            volume = np.load(file_path).astype(np.float32)
+        elif file_path.suffix == '.npz':
+            data = np.load(file_path)
+            volume = data['volume'].astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported file format: {file_path.suffix}")
+
+        # Handle different dimensions
+        if len(volume.shape) == 2:
+            # Single slice - replicate
+            volume = np.stack([volume] * num_output_slices, axis=0)
+        elif len(volume.shape) == 4:
+            # Multi-frame - take first timepoint
+            volume = volume[0]
+
+        # Normalize
+        p1, p99 = np.percentile(volume, [1, 99])
+        volume = np.clip(volume, p1, p99)
+        vol_min = volume.min()
+        vol_max = volume.max()
+        if vol_max > vol_min:
+            volume = (volume - vol_min) / (vol_max - vol_min)
+        else:
+            volume = volume - vol_min
+
+        # Sample num_output_slices uniformly across the volume
+        num_available = volume.shape[0]
+        indices = np.linspace(0, num_available - 1, num_output_slices, dtype=int)
+        slices = volume[indices]
+
+        return slices
+
+    def test(self):
+        """Testing loop: load checkpoint, perform interpolation, save results"""
+        logger.info("Starting testing...")
+
+        # Create test loader
+        test_loader = self._create_data_loader('test')
+
+        if len(test_loader.dataset) == 0:
+            logger.warning("No test data found, skipping test")
+            return
+
+        # Create output directory
+        output_dir = Path(self.args.checkpoint_dir) / 'test_results'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Test output directory: {output_dir}")
+
+        # Load best checkpoint
+        checkpoint_path = Path(self.args.checkpoint_dir) / 'best.pth'
+        if checkpoint_path.exists():
+            logger.info(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.interpolator.load_state_dict(checkpoint['interpolator_state_dict'])
+            logger.info("Checkpoint loaded successfully")
+        else:
+            logger.warning(f"Checkpoint not found at {checkpoint_path}, using current model state")
+
+        self.interpolator.eval()
+
+        # Process first test sample
+        for batch_idx, batch in enumerate(test_loader):
+            if batch_idx > 0:  # Only process first sample
+                break
+
+            file_path = batch['file_path'][0]
+            logger.info(f"Processing file: {file_path}")
+
+            # 1. Load full 257 slices (0-256)
+            logger.info("Loading original 257 slices (0-256)...")
+            full_slices = self._load_full_volume_slices(file_path, num_output_slices=257)
+            logger.info(f"Loaded full volume slices: {full_slices.shape}")
+
+            # 2. Save original 257 slices as images
+            original_dir = output_dir / 'original_257'
+            original_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Saving original slices to {original_dir}...")
+            for i, slice_data in enumerate(full_slices):
+                img = Image.fromarray((slice_data * 255).astype(np.uint8))
+                img.save(original_dir / f'slice_{i:03d}.png')
+            logger.info(f"Saved {len(full_slices)} original slices")
+
+            # 3. Extract every other slice (0, 2, 4, ..., 256) = 129 slices
+            logger.info("Extracting 129 slices (0, 2, 4, ..., 256)...")
+            sampled_indices = np.arange(0, 257, 2)  # 0, 2, 4, ..., 256
+            sampled_slices = full_slices[sampled_indices]
+            logger.info(f"Extracted sampled slices: {sampled_slices.shape}")
+
+            # 4. Perform interpolation
+            logger.info("Performing interpolation...")
+            sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
+            with torch.no_grad():
+                interpolated_volume = self.interpolate_volume(sampled_tensor)
+            interpolated_np = interpolated_volume[0].cpu().numpy()
+            logger.info(f"Interpolated volume shape: {interpolated_np.shape}")
+
+            # 5. Save interpolated 257 slices (129 original + 128 interpolated)
+            interpolated_dir = output_dir / 'interpolated_257'
+            interpolated_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Saving interpolated slices to {interpolated_dir}...")
+            for i, slice_data in enumerate(interpolated_np):
+                # Normalize to [0, 1]
+                slice_norm = np.clip(slice_data, 0, 1)
+                img = Image.fromarray((slice_norm * 255).astype(np.uint8))
+                img.save(interpolated_dir / f'slice_{i:03d}.png')
+            logger.info(f"Saved {len(interpolated_np)} interpolated slices")
+
+            logger.info(f"Test completed for sample {batch_idx}")
+            logger.info(f"Results saved to {output_dir}")
+
+        logger.info("Testing complete!")
+
 
 def main():
     """Entry point"""
@@ -505,7 +639,7 @@ def main():
     # Training settings
     parser.add_argument('--batch_size', type=int, default=2,
                        help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=100,
+    parser.add_argument('--num_epochs', type=int, default=50,
                        help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate')
@@ -531,12 +665,12 @@ def main():
                        help='Gradient clipping value')
 
     # Loss weights
-    parser.add_argument('--lambda_consistency', type=float, default=1.0,
+    parser.add_argument('--lambda_consistency', type=float, default=0.5,
                        help='Multi-view consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1,
                        help='Smoothness regularization weight')
     parser.add_argument('--consistency_loss_type', type=str, default='dice',
-                       help='Consistency loss type')
+                       help='Consistency loss type (dice/ce/mse/combined)')
 
     # Checkpointing
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
@@ -606,6 +740,7 @@ def main():
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
     pipeline.train()
+    pipeline.test()
 
 
 if __name__ == '__main__':
