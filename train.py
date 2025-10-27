@@ -24,7 +24,7 @@ from models.IFNet import IFNet
 from models.vit_seg_modeling import VisionTransformer as ViT_seg
 from models.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from utils.multi_view import MultiViewExtractor
-from losses import ConsistencyLoss, SmoothnessLoss
+from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
 
 
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +106,12 @@ class TrainingPipeline:
             loss_type=self.args.consistency_loss_type
         )
         self.smoothness_loss = SmoothnessLoss()
+
+        # Ground truth interpolation loss
+        self.interpolation_gt_loss = InterpolationGroundTruthLoss(
+            loss_type=getattr(self.args, 'interpolation_gt_loss_type', 'l1'),
+            use_ssim=True
+        )
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -234,11 +240,11 @@ class TrainingPipeline:
         sagittal_slices = volume.permute(0, 2, 1, 3)  # [B, H, N', W]
         coronal_slices = volume.permute(0, 3, 1, 2)  # [B, W, N', H]
 
-        # Debug logging
-        logger.info(f"Volume shape: {volume.shape}")
-        logger.info(f"Axial slices shape: {axial_slices.shape}")
-        logger.info(f"Sagittal slices shape: {sagittal_slices.shape}")
-        logger.info(f"Coronal slices shape: {coronal_slices.shape}")
+        # # Debug logging
+        # logger.info(f"Volume shape: {volume.shape}")
+        # logger.info(f"Axial slices shape: {axial_slices.shape}")
+        # logger.info(f"Sagittal slices shape: {sagittal_slices.shape}")
+        # logger.info(f"Coronal slices shape: {coronal_slices.shape}")
 
         # Segment each view
         with torch.no_grad():
@@ -299,13 +305,14 @@ class TrainingPipeline:
         return segmentations
 
     def compute_loss(self, seg_axial, seg_sagittal, seg_coronal,
-                     interpolated_volume):
+                     interpolated_volume, ground_truth_slices=None):
         """
-        Compute total training loss from multi-view consistency
+        Compute total training loss from multi-view consistency and ground truth
 
         Args:
             seg_axial, seg_sagittal, seg_coronal: Segmentations from different views
             interpolated_volume: Interpolated volume [B, 256, H, W]
+            ground_truth_slices: Ground truth slices [B, 257, H, W] (optional)
 
         Returns:
             loss: Total loss
@@ -323,10 +330,20 @@ class TrainingPipeline:
         # Smoothness regularization
         smoothness = self.smoothness_loss(interpolated_volume)
 
+        # Ground truth interpolation loss
+        interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
+        if ground_truth_slices is not None:
+            # Set debug=True only for first batch of each epoch
+            is_first_batch = getattr(self, '_is_first_batch', False)
+            interpolation_gt = self.interpolation_gt_loss(
+                interpolated_volume, ground_truth_slices, debug=is_first_batch
+            )
+
         # Total weighted loss
         total_loss = (
             self.args.lambda_consistency * consistency_total +
-            self.args.lambda_smoothness * smoothness
+            self.args.lambda_smoothness * smoothness +
+            getattr(self.args, 'lambda_interpolation_gt', 0.0) * interpolation_gt
         )
 
         loss_dict = {
@@ -334,7 +351,8 @@ class TrainingPipeline:
             'consistency': consistency_total.item(),
             'consistency_sagittal': consistency_sag.item(),
             'consistency_coronal': consistency_cor.item(),
-            'smoothness': smoothness.item()
+            'smoothness': smoothness.item(),
+            'interpolation_gt': interpolation_gt.item() if isinstance(interpolation_gt, torch.Tensor) else interpolation_gt
         }
 
         return total_loss, loss_dict
@@ -348,6 +366,12 @@ class TrainingPipeline:
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.num_epochs}')
         for batch_idx, batch in enumerate(pbar):
             slices = batch['slices'].to(self.device)  # [B, N, H, W]
+            ground_truth_slices = batch.get('ground_truth_slices', None)
+            if ground_truth_slices is not None:
+                ground_truth_slices = ground_truth_slices.to(self.device)  # [B, 257, H, W]
+
+            # Set debug flag for first batch
+            self._is_first_batch = (batch_idx == 0)
 
             # Forward pass
             self.optimizer.zero_grad()
@@ -362,7 +386,7 @@ class TrainingPipeline:
             # 3. Compute losses
             loss, loss_dict = self.compute_loss(
                 seg_axial, seg_sagittal, seg_coronal,
-                interpolated_volume
+                interpolated_volume, ground_truth_slices
             )
 
             # Backward pass
@@ -379,7 +403,10 @@ class TrainingPipeline:
 
             # Logging
             epoch_losses.append(loss_dict)
-            pbar.set_postfix({'loss': f"{loss_dict['total']:.4f}"})
+
+            # Print detailed loss breakdown
+            loss_str = f"Total: {loss_dict['total']:.4f} | Consistency: {loss_dict['consistency']:.4f} | Smoothness: {loss_dict['smoothness']:.4f} | InterpolationGT: {loss_dict['interpolation_gt']:.4f}"
+            pbar.set_postfix({'loss': loss_str}, refresh=True)
 
             if self.args.use_wandb and self.global_step % self.args.log_interval == 0:
                 wandb.log({f'train/{k}': v for k, v in loss_dict.items()},
@@ -404,6 +431,9 @@ class TrainingPipeline:
 
         for batch in tqdm(self.val_loader, desc='Validation'):
             slices = batch['slices'].to(self.device)
+            ground_truth_slices = batch.get('ground_truth_slices', None)
+            if ground_truth_slices is not None:
+                ground_truth_slices = ground_truth_slices.to(self.device)
 
             # Forward pass
             interpolated_volume = self.interpolate_volume(slices)
@@ -412,7 +442,7 @@ class TrainingPipeline:
 
             loss, loss_dict = self.compute_loss(
                 seg_axial, seg_sagittal, seg_coronal,
-                interpolated_volume
+                interpolated_volume, ground_truth_slices
             )
 
             val_losses.append(loss_dict)
@@ -466,11 +496,23 @@ class TrainingPipeline:
         for epoch in range(1, self.args.num_epochs + 1):
             # Train
             train_loss = self.train_epoch(epoch)
-            logger.info(f"Epoch {epoch} - Train Loss: {train_loss['total']:.4f}")
+            logger.info(f"Epoch {epoch} - Train Loss Details:")
+            logger.info(f"  Total: {train_loss['total']:.4f}")
+            logger.info(f"  Consistency: {train_loss['consistency']:.4f}")
+            logger.info(f"  Consistency Sagittal: {train_loss['consistency_sagittal']:.4f}")
+            logger.info(f"  Consistency Coronal: {train_loss['consistency_coronal']:.4f}")
+            logger.info(f"  Smoothness: {train_loss['smoothness']:.4f}")
+            logger.info(f"  Interpolation GT: {train_loss['interpolation_gt']:.4f}")
 
             # Validate
             val_loss = self.validate(epoch)
-            logger.info(f"Epoch {epoch} - Val Loss: {val_loss['total']:.4f}")
+            logger.info(f"Epoch {epoch} - Val Loss Details:")
+            logger.info(f"  Total: {val_loss['total']:.4f}")
+            logger.info(f"  Consistency: {val_loss['consistency']:.4f}")
+            logger.info(f"  Consistency Sagittal: {val_loss['consistency_sagittal']:.4f}")
+            logger.info(f"  Consistency Coronal: {val_loss['consistency_coronal']:.4f}")
+            logger.info(f"  Smoothness: {val_loss['smoothness']:.4f}")
+            logger.info(f"  Interpolation GT: {val_loss['interpolation_gt']:.4f}")
 
             # Update learning rate
             self.scheduler.step()
@@ -665,12 +707,16 @@ def main():
                        help='Gradient clipping value')
 
     # Loss weights
-    parser.add_argument('--lambda_consistency', type=float, default=0.5,
+    parser.add_argument('--lambda_consistency', type=float, default=0.1,
                        help='Multi-view consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1,
                        help='Smoothness regularization weight')
+    parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0,
+                       help='Ground truth interpolation loss weight')
     parser.add_argument('--consistency_loss_type', type=str, default='dice',
                        help='Consistency loss type (dice/ce/mse/combined)')
+    parser.add_argument('--interpolation_gt_loss_type', type=str, default='l1',
+                       help='Ground truth interpolation loss type (l1/l2/smooth_l1)')
 
     # Checkpointing
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',

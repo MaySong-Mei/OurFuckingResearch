@@ -95,18 +95,21 @@ class MedicalVolumeDataset(Dataset):
         # Preprocess
         volume = self._preprocess_volume(volume)
 
-        # Extract slices
-        slices = self._extract_slices(volume)
+        # Extract slices (sampled: 0, 2, 4, ..., 256) and ground truth (all slices)
+        slices, ground_truth_slices = self._extract_slices(volume)
 
         # Convert to tensor
         slices_tensor = torch.from_numpy(slices).float()
+        ground_truth_tensor = torch.from_numpy(ground_truth_slices).float()
 
         # Apply transforms
         if self.transform is not None:
             slices_tensor = self.transform(slices_tensor)
+            ground_truth_tensor = self.transform(ground_truth_tensor)
 
         sample = {
-            'slices': slices_tensor,
+            'slices': slices_tensor,  # [N, H, W] - sampled slices (129 slices)
+            'ground_truth_slices': ground_truth_tensor,  # [257, H, W] - all slices (0-256)
             'file_path': str(file_path),
             'volume_shape': volume.shape
         }
@@ -201,11 +204,21 @@ class MedicalVolumeDataset(Dataset):
         resized = zoom(volume, zoom_factors, order=1)
         return resized
 
-    def _extract_slices(self, volume: np.ndarray) -> np.ndarray:
-        """Extract N slices from volume with step of 2 (0, 2, 4, 6, ...)"""
+    def _extract_slices(self, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extract slices from volume:
+        1. Sampled slices: every 2nd slice (0, 2, 4, ..., 256) - 129 slices
+        2. Ground truth slices: all consecutive slices (0-256) - 257 slices
+
+        Returns:
+            slices: [N, H, W] - sampled slices (129 slices with step=2)
+            ground_truth_slices: [257, H, W] - all slices (0-256)
+        """
         if len(volume.shape) == 2:
-            # Single slice - replicate
-            return np.stack([volume] * self.num_slices, axis=0)
+            # Single slice - replicate for both
+            slices = np.stack([volume] * self.num_slices, axis=0)
+            ground_truth_slices = np.stack([volume] * (self.num_slices * 2 - 1), axis=0)
+            return slices, ground_truth_slices
 
         num_slices_available = volume.shape[0]
 
@@ -214,17 +227,27 @@ class MedicalVolumeDataset(Dataset):
             indices = np.arange(0, num_slices_available, 2)
             indices = indices[:self.num_slices]
             slices = volume[indices]
+
+            # Ground truth: all consecutive slices from 0 to min(256, num_slices_available-1)
+            # For 129 sampled slices with step=2, we need 257 consecutive slices
+            num_gt_slices = self.num_slices * 2 - 1  # 257 for 129 sampled slices
+            if num_slices_available >= num_gt_slices:
+                ground_truth_slices = volume[:num_gt_slices]
+            else:
+                # If not enough slices, pad with the last slice
+                ground_truth_slices = volume.copy()
+                pad_size = num_gt_slices - num_slices_available
+                ground_truth_slices = np.pad(
+                    ground_truth_slices,
+                    ((0, pad_size), (0, 0), (0, 0)),
+                    mode='edge'
+                )
         else:
-            # Pad with zeros if not enough slices
+            # Not enough slices
             raise ValueError(f"Not enough slices in volume: {num_slices_available} available, "
                              f"but {self.num_slices * 2} needed for step=2 sampling")
 
-        # Add channel dimension if needed
-        if len(slices.shape) == 3:
-            slices = slices[:, np.newaxis, :, :]  # [N, 1, H, W]
-            slices = slices.squeeze(1)  # [N, H, W] for now
-
-        return slices
+        return slices, ground_truth_slices
 
 
 class SimpleDICOMDataset(Dataset):
@@ -272,18 +295,21 @@ class SimpleDICOMDataset(Dataset):
         if volume.shape[-2:] != self.img_size:
             volume = self._resize_volume(volume, self.img_size)
 
-        # Extract slices
-        slices = self._extract_slices(volume)
+        # Extract slices (sampled and ground truth)
+        slices, ground_truth_slices = self._extract_slices(volume)
 
         # Convert to tensor
         slices_tensor = torch.from_numpy(slices).float()
+        ground_truth_tensor = torch.from_numpy(ground_truth_slices).float()
 
         # Apply transforms
         if self.transform is not None:
             slices_tensor = self.transform(slices_tensor)
+            ground_truth_tensor = self.transform(ground_truth_tensor)
 
         sample = {
-            'slices': slices_tensor,
+            'slices': slices_tensor,  # [N, H, W] - sampled slices (129 slices)
+            'ground_truth_slices': ground_truth_tensor,  # [257, H, W] - all slices (0-256)
             'file_path': str(self.dicom_path),
             'volume_shape': volume.shape
         }
@@ -351,11 +377,21 @@ class SimpleDICOMDataset(Dataset):
         resized = zoom(volume, zoom_factors, order=1)
         return resized
 
-    def _extract_slices(self, volume: np.ndarray) -> np.ndarray:
-        """Extract N slices from volume with step of 2 (0, 2, 4, 6, ...)"""
+    def _extract_slices(self, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extract slices from volume:
+        1. Sampled slices: every 2nd slice (0, 2, 4, ..., 256) - 129 slices
+        2. Ground truth slices: all consecutive slices (0-256) - 257 slices
+
+        Returns:
+            slices: [N, H, W] - sampled slices (129 slices with step=2)
+            ground_truth_slices: [257, H, W] - all slices (0-256)
+        """
         if len(volume.shape) == 2:
-            # Single slice - replicate
-            return np.stack([volume] * self.num_slices, axis=0)
+            # Single slice - replicate for both
+            slices = np.stack([volume] * self.num_slices, axis=0)
+            ground_truth_slices = np.stack([volume] * (self.num_slices * 2 - 1), axis=0)
+            return slices, ground_truth_slices
 
         num_slices_available = volume.shape[0]
 
@@ -364,8 +400,23 @@ class SimpleDICOMDataset(Dataset):
             indices = np.arange(0, num_slices_available, 2)
             indices = indices[:self.num_slices]
             slices = volume[indices]
+
+            # Ground truth: all consecutive slices from 0 to min(256, num_slices_available-1)
+            # For 129 sampled slices with step=2, we need 257 consecutive slices
+            num_gt_slices = self.num_slices * 2 - 1  # 257 for 129 sampled slices
+            if num_slices_available >= num_gt_slices:
+                ground_truth_slices = volume[:num_gt_slices]
+            else:
+                # If not enough slices, pad with the last slice
+                ground_truth_slices = volume.copy()
+                pad_size = num_gt_slices - num_slices_available
+                ground_truth_slices = np.pad(
+                    ground_truth_slices,
+                    ((0, pad_size), (0, 0), (0, 0)),
+                    mode='edge'
+                )
         else:
             raise ValueError(f"Not enough slices in volume: {num_slices_available} available, "
                              f"but {self.num_slices * 2} needed for step=2 sampling")
 
-        return slices
+        return slices, ground_truth_slices
