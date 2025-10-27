@@ -209,8 +209,8 @@ def prepare_data(
             continue
 
         # Skip volumes with insufficient slices for interpolation
-        # Need at least 129 slices to interpolate to 256
-        min_slices = 129
+        # Need at least 258 slices (257*2) for step=2 sampling to extract 257 slices
+        min_slices = 258
         if volume.shape[0] < min_slices:
             logger.warning(f"Skipping {case_id}/{anatomy}/{series_name} - only {volume.shape[0]} slices (need >= {min_slices})")
             continue

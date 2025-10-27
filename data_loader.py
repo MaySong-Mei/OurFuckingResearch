@@ -202,21 +202,22 @@ class MedicalVolumeDataset(Dataset):
         return resized
 
     def _extract_slices(self, volume: np.ndarray) -> np.ndarray:
-        """Extract N slices from volume"""
+        """Extract N slices from volume with step of 2 (0, 2, 4, 6, ...)"""
         if len(volume.shape) == 2:
             # Single slice - replicate
             return np.stack([volume] * self.num_slices, axis=0)
 
         num_slices_available = volume.shape[0]
 
-        if num_slices_available >= self.num_slices:
-            # Uniformly sample slices
-            indices = np.linspace(0, num_slices_available - 1, self.num_slices, dtype=int)
+        if num_slices_available >= self.num_slices * 2:
+            # Sample with step of 2 (every other slice: 0, 2, 4, 6, ...)
+            indices = np.arange(0, num_slices_available, 2)
+            indices = indices[:self.num_slices]
             slices = volume[indices]
         else:
             # Pad with zeros if not enough slices
-            slices = np.zeros((self.num_slices, *self.img_size), dtype=np.float32)
-            slices[:num_slices_available] = volume
+            raise ValueError(f"Not enough slices in volume: {num_slices_available} available, "
+                             f"but {self.num_slices * 2} needed for step=2 sampling")
 
         # Add channel dimension if needed
         if len(slices.shape) == 3:
@@ -351,20 +352,20 @@ class SimpleDICOMDataset(Dataset):
         return resized
 
     def _extract_slices(self, volume: np.ndarray) -> np.ndarray:
-        """Extract N slices from volume"""
+        """Extract N slices from volume with step of 2 (0, 2, 4, 6, ...)"""
         if len(volume.shape) == 2:
             # Single slice - replicate
             return np.stack([volume] * self.num_slices, axis=0)
 
         num_slices_available = volume.shape[0]
 
-        if num_slices_available >= self.num_slices:
-            # Uniformly sample slices
-            indices = np.linspace(0, num_slices_available - 1, self.num_slices, dtype=int)
+        if num_slices_available >= self.num_slices * 2:
+            # Sample with step of 2 (every other slice: 0, 2, 4, 6, ...)
+            indices = np.arange(0, num_slices_available, 2)
+            indices = indices[:self.num_slices]
             slices = volume[indices]
         else:
-            # Pad with zeros if not enough slices
-            slices = np.zeros((self.num_slices, *self.img_size), dtype=np.float32)
-            slices[:num_slices_available] = volume
+            raise ValueError(f"Not enough slices in volume: {num_slices_available} available, "
+                             f"but {self.num_slices * 2} needed for step=2 sampling")
 
         return slices
