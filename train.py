@@ -299,7 +299,7 @@ class TrainingPipeline:
         return segmentations
 
     def compute_loss(self, seg_axial, seg_sagittal, seg_coronal,
-                     interpolated_volume, original_slices):
+                     interpolated_volume):
         """
         Compute total training loss from multi-view consistency
 
