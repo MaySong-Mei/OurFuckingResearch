@@ -2,35 +2,29 @@
 3D Medical Image Interpolation Training Pipeline
 Self-Supervised Multi-View Consistency Approach
 
-Uses RIFE for interpolation and U-Net for segmentation.
+Uses IFNet for interpolation and MONAI UNET for segmentation.
 """
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 import logging
 from tqdm import tqdm
-import wandb
 from datetime import datetime
 import numpy as np
 from PIL import Image
 import pydicom
-from scipy.ndimage import zoom
 
-from data_loader import MedicalVolumeDataset, SimpleDICOMDataset
+from data_loader import MedicalVolumeDataset
 from models.IFNet import IFNet
-from models.vit_seg_modeling import VisionTransformer as ViT_seg
-from models.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
-from utils.multi_view import MultiViewExtractor
+from models.medsam_infer import MedSAM2Segmenter
 from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
 
 
 class TrainingPipeline:
@@ -43,75 +37,33 @@ class TrainingPipeline:
         # Initialize models
         self.interpolator = IFNet().to(self.device)
 
-        # Load frozen segmentation model using TransUNet's ViT_seg
-        logger.info("Using Vision Transformer (TransUNet) for segmentation")
+        # Initialize MedSAM2 for 3D segmentation
+        logger.info("Using MedSAM2 for 3D segmentation")
+        # Use absolute path with // prefix for Hydra
+        medsam2_config = "//" + "/gpfs/radev/project/zhuoran_yang/sl3348/Med_Segmentation/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml"
+        medsam2_ckpt = "/gpfs/radev/project/zhuoran_yang/sl3348/Med_Segmentation/MedSAM2/checkpoints/MedSAM2_latest.pt"
 
-        # Get the ViT configuration
-        vit_name = self.args.vit_name
-        config_vit = CONFIGS_ViT_seg[vit_name]
-        config_vit.n_classes = self.args.num_classes
-
-        # Set n_skip if provided (default to 3 for skip connections)
-        if not hasattr(config_vit, 'n_skip'):
-            config_vit.n_skip = self.args.n_skip
-
-        # Set patch size
-        vit_patches_size = self.args.vit_patches_size
-        config_vit.patches.size = (vit_patches_size, vit_patches_size)
-
-        # Handle ResNet hybrid models
-        if vit_name.find('R50') != -1:
-            config_vit.patches.grid = (
-                int(self.args.img_size[0] / vit_patches_size),
-                int(self.args.img_size[1] / vit_patches_size)
+        try:
+            self.segmentation = MedSAM2Segmenter(
+                config_file=medsam2_config,
+                ckpt_path=medsam2_ckpt,
+                num_classes=self.args.num_classes,
+                device=str(self.device),
+                use_bfloat16=True
             )
-            # Add skip_channels for ResNet hybrid models
-            if not hasattr(config_vit, 'skip_channels'):
-                config_vit.skip_channels = [512, 256, 64, 16]
-        else:
-            # For non-ResNet models, ensure skip_channels exists (set to zeros)
-            if not hasattr(config_vit, 'skip_channels'):
-                config_vit.skip_channels = [0, 0, 0, 0]
-
-        # Initialize the model
-        self.segmentation = ViT_seg(
-            config_vit,
-            img_size=self.args.img_size[0],  # Assumes square images
-            num_classes=config_vit.n_classes
-        ).to(self.device)
-
-        # Load pretrained ImageNet weights from config_vit.pretrained_path
-        import os
-        if hasattr(config_vit, 'pretrained_path') and config_vit.pretrained_path:
-            pretrained_path = config_vit.pretrained_path
-            logger.info(f"Loading pretrained ViT weights from: {pretrained_path}")
-            if os.path.exists(pretrained_path):
-                self.segmentation.load_from(weights=np.load(pretrained_path))
-                logger.info("Pretrained ViT weights loaded successfully")
-            else:
-                logger.warning(f"Pretrained weights file not found: {pretrained_path}")
-                logger.warning("Continuing with randomly initialized weights")
-        else:
-            logger.info("No pretrained weights specified, using random initialization")
+            logger.info(f"Loaded MedSAM2 from {medsam2_ckpt}")
+        except Exception as e:
+            logger.error(f"Failed to load MedSAM2: {e}")
+            raise
 
         self.segmentation.eval()
         for param in self.segmentation.parameters():
             param.requires_grad = False
 
-        # Multi-view extractor
-        self.multi_view_extractor = MultiViewExtractor()
-
-        # Loss functions (self-supervised: multi-view consistency based)
-        self.consistency_loss = ConsistencyLoss(
-            loss_type=self.args.consistency_loss_type
-        )
+        # Loss functions
+        self.consistency_loss = ConsistencyLoss(loss_type='dice')
         self.smoothness_loss = SmoothnessLoss()
-
-        # Ground truth interpolation loss
-        self.interpolation_gt_loss = InterpolationGroundTruthLoss(
-            loss_type=getattr(self.args, 'interpolation_gt_loss_type', 'l1'),
-            use_ssim=True
-        )
+        self.interpolation_gt_loss = InterpolationGroundTruthLoss(loss_type='l1', use_ssim=True)
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -134,35 +86,18 @@ class TrainingPipeline:
         # Metrics tracking
         self.best_val_loss = float('inf')
         self.global_step = 0
-
-        # Setup logging
-        if self.args.use_wandb:
-            wandb.init(
-                project=self.args.project_name,
-                config=vars(self.args),
-                name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
+        self.save_interval = 10
+        self.log_interval = 10
+        self.lambda_interpolation_gt = 0.0
 
     def _create_data_loader(self, split: str) -> DataLoader:
-        """Create data loader for train/val split"""
-        if self.args.single_file_mode:
-            # Use SimpleDICOMDataset for single file
-            # In single file mode, we use the same file for train and val
-            dataset = SimpleDICOMDataset(
-                dicom_path=self.args.single_dicom_path,
-                num_slices=self.args.num_slices,
-                img_size=self.args.img_size,
-                normalize=True
-            )
-        else:
-            # Use MedicalVolumeDataset for multiple files
-            dataset = MedicalVolumeDataset(
-                data_dir=self.args.data_dir,
-                split=split,
-                num_slices=self.args.num_slices,
-                img_size=self.args.img_size,
-                cache_data=self.args.cache_data
-            )
+        """Create data loader for train/val/test split"""
+        dataset = MedicalVolumeDataset(
+            data_dir=self.args.data_dir,
+            split=split,
+            num_slices=self.args.num_slices,
+            img_size=self.args.img_size
+        )
 
         return DataLoader(
             dataset,
@@ -225,87 +160,37 @@ class TrainingPipeline:
 
     def compute_multi_view_segmentations(self, volume: torch.Tensor):
         """
-        Compute segmentations for all three orthogonal views
+        Compute segmentations for three orthogonal views separately
+        Segment axial view, sagittal view, and coronal view independently
 
         Args:
-            volume: [B, N', H, W] interpolated volume
+            volume: [B, 256, 256, 256] - 3D interpolated volume
 
         Returns:
-            seg_axial: [B, N', H, W, C] - axial segmentations
-            seg_sagittal: [B, H, N', W, C] - sagittal segmentations
-            seg_coronal: [B, W, N', H, C] - coronal segmentations
+            seg_axial: [B, C, 256, 256, 256] - axial view segmentation (3D)
+            seg_sagittal: [B, C, 256, 256, 256] - sagittal view segmentation (3D)
+            seg_coronal: [B, C, 256, 256, 256] - coronal view segmentation (3D)
         """
-        # Extract views
-        axial_slices = volume  # [B, N', H, W]
-        sagittal_slices = volume.permute(0, 2, 1, 3)  # [B, H, N', W]
-        coronal_slices = volume.permute(0, 3, 1, 2)  # [B, W, N', H]
+        B = volume.shape[0]
 
-        # # Debug logging
-        # logger.info(f"Volume shape: {volume.shape}")
-        # logger.info(f"Axial slices shape: {axial_slices.shape}")
-        # logger.info(f"Sagittal slices shape: {sagittal_slices.shape}")
-        # logger.info(f"Coronal slices shape: {coronal_slices.shape}")
+        # Add channel dimension: [B, 256, 256, 256] -> [B, 1, 256, 256, 256]
+        volume_3d = volume.unsqueeze(1)
 
-        # Segment each view
         with torch.no_grad():
-            seg_axial = self._segment_slices(axial_slices)
-            seg_sagittal = self._segment_slices(sagittal_slices)
-            seg_coronal = self._segment_slices(coronal_slices)
+            # Axial view: segment original volume (looking along Z-axis)
+            seg_axial = self.segmentation(volume_3d)  # [B, C, 256, 256, 256]
+
+            # Sagittal view: permute and segment (looking along X-axis)
+            # [B, 1, 256, 256, 256] -> [B, 1, 256, 256, 256] (rearrange to x-axis view)
+            vol_sagittal = volume.permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, 256, 256, 256]
+            seg_sagittal = self.segmentation(vol_sagittal)  # [B, C, 256, 256, 256]
+
+            # Coronal view: permute and segment (looking along Y-axis)
+            # [B, 256, 256, 256] -> [B, 1, 256, 256, 256] (rearrange to y-axis view)
+            vol_coronal = volume.permute(0, 2, 3, 1).unsqueeze(1)  # [B, 1, 256, 256, 256]
+            seg_coronal = self.segmentation(vol_coronal)  # [B, C, 256, 256, 256]
 
         return seg_axial, seg_sagittal, seg_coronal
-
-    def _segment_slices(self, slices: torch.Tensor) -> torch.Tensor:
-        """
-        Segment a batch of slices using TransUNet's ViT_seg
-        Handles interpolation if slices are not 256x256
-
-        Args:
-            slices: [B, N, H, W] - grayscale slices
-
-        Returns:
-            segmentations: [B, N, H, W, C] - class probabilities/logits
-        """
-        B, N, H, W = slices.shape
-        expected_size = self.args.img_size[0]  # 256
-
-        # Debug logging
-        logger.debug(f"_segment_slices input shape: [B={B}, N={N}, H={H}, W={W}]")
-
-        # Reshape to process all slices at once
-        slices_flat = slices.reshape(B * N, 1, H, W)  # [B*N, 1, H, W]
-
-        # If spatial dimensions don't match expected size, resize
-        if H != expected_size or W != expected_size:
-            logger.debug(f"Resizing from {H}x{W} to {expected_size}x{expected_size}")
-            slices_flat = torch.nn.functional.interpolate(
-                slices_flat,
-                size=(expected_size, expected_size),
-                mode='bilinear',
-                align_corners=False
-            )  # [B*N, 1, expected_size, expected_size]
-
-        # Convert grayscale to 3-channel by repeating
-        slices_flat = slices_flat.repeat(1, 3, 1, 1)  # [B*N, 3, expected_size, expected_size]
-
-        # Segment - ViT_seg expects 3-channel RGB input
-        seg_flat = self.segmentation(slices_flat)  # [B*N, num_classes, expected_size, expected_size]
-
-        # Resize back to original spatial dimensions if needed
-        if H != expected_size or W != expected_size:
-            logger.debug(f"Resizing segmentation back to {H}x{W}")
-            seg_flat = torch.nn.functional.interpolate(
-                seg_flat,
-                size=(H, W),
-                mode='bilinear',
-                align_corners=False
-            )  # [B*N, num_classes, H, W]
-
-        # Reshape back
-        C = seg_flat.shape[1]
-        segmentations = seg_flat.reshape(B, N, C, H, W)  # [B, N, C, H, W]
-        segmentations = segmentations.permute(0, 1, 3, 4, 2)  # [B, N, H, W, C]
-
-        return segmentations
 
     def compute_loss(self, seg_axial, seg_sagittal, seg_coronal,
                      interpolated_volume, ground_truth_slices=None):
@@ -322,13 +207,59 @@ class TrainingPipeline:
             loss_dict: Dictionary of individual loss components
         """
         # Remap sagittal and coronal to axial space for comparison
-        seg_sagittal_remapped = seg_sagittal.permute(0, 2, 1, 3, 4)  # [B, N', H, W, C]
-        seg_coronal_remapped = seg_coronal.permute(0, 2, 3, 1, 4)   # [B, N', H, W, C]
+        # seg_axial: [B, C, Z, Y, X]
+        # seg_sagittal: [B, C, X, Z, Y] (from permuted volume) -> need [B, C, Z, Y, X]
+        # seg_coronal: [B, C, Y, X, Z] (from permuted volume) -> need [B, C, Z, Y, X]
+        seg_sagittal_remapped = seg_sagittal.permute(0, 1, 3, 4, 2)  # [B, C, Z, Y, X]
+        seg_coronal_remapped = seg_coronal.permute(0, 1, 4, 2, 3)   # [B, C, Z, Y, X]
+
+        # Convert to [B, Z, Y, X, C] format for consistency loss (expects last dim as classes)
+        seg_axial_fmt = seg_axial.permute(0, 2, 3, 4, 1)  # [B, Z, Y, X, C]
+        seg_sag_fmt = seg_sagittal_remapped.permute(0, 2, 3, 4, 1)  # [B, Z, Y, X, C]
+        seg_cor_fmt = seg_coronal_remapped.permute(0, 2, 3, 4, 1)  # [B, Z, Y, X, C]
+
+        is_first_batch = getattr(self, '_is_first_batch', False)
+
+        prob_axial = F.softmax(seg_axial_fmt, dim=-1)
+        class_pred_axial = torch.argmax(seg_axial_fmt, dim=-1)
+        logit_diff = seg_axial_fmt[..., 1] - seg_axial_fmt[..., 0]  # class1_logit - class0_logit
+
+        # Debug: Check segmentation output shape and values
+        logger.info(f"DEBUG Axial - seg_axial_fmt shape: {seg_axial_fmt.shape}, dtype: {seg_axial_fmt.dtype}")
+        logger.info(f"DEBUG Axial - class_pred_axial shape: {class_pred_axial.shape}, min: {class_pred_axial.min()}, max: {class_pred_axial.max()}")
+        logger.info(f"Axial - Logits: max={seg_axial_fmt.max():.4f}, min={seg_axial_fmt.min():.4f}, mean={seg_axial_fmt.mean():.4f}")
+        logger.info(f"Axial - Logit diff (class1-class0): mean={logit_diff.mean():.4f}, std={logit_diff.std():.4f}")
+        logger.info(f"Axial - Prob class1: mean={prob_axial[..., 1].mean():.6f}, max={prob_axial[..., 1].max():.6f}")
+
+        # Fixed bincount with proper handling
+        class_pred_flat = class_pred_axial.flatten().int()
+        class_dist = torch.bincount(class_pred_flat)
+        logger.info(f"Axial - Class distribution: {class_dist.tolist()} (ratio: {(class_dist.float() / class_pred_axial.numel()).tolist()})")
+        prob_sagittal = F.softmax(seg_sag_fmt, dim=-1)
+        class_pred_sagittal = torch.argmax(seg_sag_fmt, dim=-1)
+        logit_diff_sag = seg_sag_fmt[..., 1] - seg_sag_fmt[..., 0]
+        logger.info(f"DEBUG Sagittal - seg_sag_fmt shape: {seg_sag_fmt.shape}, dtype: {seg_sag_fmt.dtype}")
+        logger.info(f"DEBUG Sagittal - class_pred_sagittal shape: {class_pred_sagittal.shape}, min: {class_pred_sagittal.min()}, max: {class_pred_sagittal.max()}")
+        logger.info(f"Sagittal - Logit diff (class1-class0): mean={logit_diff_sag.mean():.4f}, std={logit_diff_sag.std():.4f}")
+        logger.info(f"Sagittal - Prob class1: mean={prob_sagittal[..., 1].mean():.6f}, max={prob_sagittal[..., 1].max():.6f}")
+        class_pred_sag_flat = class_pred_sagittal.flatten().int()
+        class_dist_sag = torch.bincount(class_pred_sag_flat)
+        logger.info(f"Sagittal - Class distribution: {class_dist_sag.tolist()} (ratio: {(class_dist_sag.float() / class_pred_sagittal.numel()).tolist()})")
+
+        prob_coronal = F.softmax(seg_cor_fmt, dim=-1)
+        class_pred_coronal = torch.argmax(seg_cor_fmt, dim=-1)
+        logit_diff_cor = seg_cor_fmt[..., 1] - seg_cor_fmt[..., 0]
+        logger.info(f"DEBUG Coronal - seg_cor_fmt shape: {seg_cor_fmt.shape}, dtype: {seg_cor_fmt.dtype}")
+        logger.info(f"DEBUG Coronal - class_pred_coronal shape: {class_pred_coronal.shape}, min: {class_pred_coronal.min()}, max: {class_pred_coronal.max()}")
+        logger.info(f"Coronal - Logit diff (class1-class0): mean={logit_diff_cor.mean():.4f}, std={logit_diff_cor.std():.4f}")
+        logger.info(f"Coronal - Prob class1: mean={prob_coronal[..., 1].mean():.6f}, max={prob_coronal[..., 1].max():.6f}")
+        class_pred_cor_flat = class_pred_coronal.flatten().int()
+        class_dist_cor = torch.bincount(class_pred_cor_flat)
+        logger.info(f"Coronal - Class distribution: {class_dist_cor.tolist()} (ratio: {(class_dist_cor.float() / class_pred_coronal.numel()).tolist()})")
 
         # Multi-view consistency losses (self-supervised signal)
-        is_first_batch = getattr(self, '_is_first_batch', False)
-        consistency_sag = self.consistency_loss(seg_axial, seg_sagittal_remapped, debug=is_first_batch)
-        consistency_cor = self.consistency_loss(seg_axial, seg_coronal_remapped, debug=is_first_batch)
+        consistency_sag = self.consistency_loss(seg_axial_fmt, seg_sag_fmt, debug=is_first_batch)
+        consistency_cor = self.consistency_loss(seg_axial_fmt, seg_cor_fmt, debug=is_first_batch)
         consistency_total = (consistency_sag + consistency_cor) / 2
 
         # Smoothness regularization
@@ -347,7 +278,7 @@ class TrainingPipeline:
         total_loss = (
             self.args.lambda_consistency * consistency_total +
             self.args.lambda_smoothness * smoothness +
-            getattr(self.args, 'lambda_interpolation_gt', 0.0) * interpolation_gt
+            self.lambda_interpolation_gt * interpolation_gt
         )
 
         loss_dict = {
@@ -412,10 +343,6 @@ class TrainingPipeline:
             loss_str = f"Total: {loss_dict['total']:.4f} | Consistency: {loss_dict['consistency']:.4f} | Smoothness: {loss_dict['smoothness']:.4f} | InterpolationGT: {loss_dict['interpolation_gt']:.4f}"
             pbar.set_postfix({'loss': loss_str}, refresh=True)
 
-            if self.args.use_wandb and self.global_step % self.args.log_interval == 0:
-                wandb.log({f'train/{k}': v for k, v in loss_dict.items()},
-                         step=self.global_step)
-
             self.global_step += 1
 
         # Average epoch metrics
@@ -428,12 +355,13 @@ class TrainingPipeline:
 
     @torch.no_grad()
     def validate(self, epoch: int):
-        """Validation loop"""
+        """Validation loop with segmentation visualization"""
         self.interpolator.eval()
 
         val_losses = []
+        visualize_done = False
 
-        for batch in tqdm(self.val_loader, desc='Validation'):
+        for batch_idx, batch in enumerate(tqdm(self.val_loader, desc='Validation')):
             slices = batch['slices'].to(self.device)
             ground_truth_slices = batch.get('ground_truth_slices', None)
             if ground_truth_slices is not None:
@@ -456,10 +384,6 @@ class TrainingPipeline:
             k: sum(d[k] for d in val_losses) / len(val_losses)
             for k in val_losses[0].keys()
         }
-
-        if self.args.use_wandb:
-            wandb.log({f'val/{k}': v for k, v in avg_val_loss.items()},
-                     step=self.global_step)
 
         return avg_val_loss
 
@@ -487,50 +411,38 @@ class TrainingPipeline:
             logger.info(f"Saved best model with val_loss: {val_loss:.4f}")
 
         # Save periodic
-        if epoch % self.args.save_interval == 0:
+        if epoch % self.save_interval == 0:
             epoch_path = Path(self.args.checkpoint_dir) / f'epoch_{epoch}.pth'
             torch.save(checkpoint, epoch_path)
+
+    def _log_losses(self, losses: dict, prefix: str, epoch: int):
+        """Log loss dictionary"""
+        msg = f"{prefix} Epoch {epoch}: "
+        msg += " | ".join([f"{k}={v:.4f}" for k, v in losses.items()])
+        logger.info(msg)
 
     def train(self):
         """Main training loop"""
         logger.info(f"Starting training on {self.device}")
-        logger.info(f"Training samples: {len(self.train_loader.dataset)}")
-        logger.info(f"Validation samples: {len(self.val_loader.dataset)}")
+        logger.info(f"Dataset: {len(self.train_loader.dataset)} train, {len(self.val_loader.dataset)} val")
 
         for epoch in range(1, self.args.num_epochs + 1):
-            # Train
             train_loss = self.train_epoch(epoch)
-            logger.info(f"Epoch {epoch} - Train Loss Details:")
-            logger.info(f"  Total: {train_loss['total']:.4f}")
-            logger.info(f"  Consistency: {train_loss['consistency']:.4f}")
-            logger.info(f"  Consistency Sagittal: {train_loss['consistency_sagittal']:.4f}")
-            logger.info(f"  Consistency Coronal: {train_loss['consistency_coronal']:.4f}")
-            logger.info(f"  Smoothness: {train_loss['smoothness']:.4f}")
-            logger.info(f"  Interpolation GT: {train_loss['interpolation_gt']:.4f}")
+            self._log_losses(train_loss, "TRAIN", epoch)
 
-            # Validate
             val_loss = self.validate(epoch)
-            logger.info(f"Epoch {epoch} - Val Loss Details:")
-            logger.info(f"  Total: {val_loss['total']:.4f}")
-            logger.info(f"  Consistency: {val_loss['consistency']:.4f}")
-            logger.info(f"  Consistency Sagittal: {val_loss['consistency_sagittal']:.4f}")
-            logger.info(f"  Consistency Coronal: {val_loss['consistency_coronal']:.4f}")
-            logger.info(f"  Smoothness: {val_loss['smoothness']:.4f}")
-            logger.info(f"  Interpolation GT: {val_loss['interpolation_gt']:.4f}")
+            self._log_losses(val_loss, "VAL", epoch)
 
-            # Update learning rate
             self.scheduler.step()
 
             # Save checkpoint
             is_best = val_loss['total'] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss['total']
-
             self.save_checkpoint(epoch, val_loss['total'], is_best)
 
         logger.info("Training complete!")
-        if self.args.use_wandb:
-            wandb.finish()
+
 
     def _load_full_volume_slices(self, file_path: str, num_output_slices: int = 257) -> np.ndarray:
         """
@@ -584,84 +496,68 @@ class TrainingPipeline:
         return slices
 
     def test(self):
-        """Testing loop: load checkpoint, perform interpolation, save results"""
+        """Testing: load checkpoint, interpolate volume, visualize multi-view segmentations"""
         logger.info("Starting testing...")
 
-        # Create test loader
         test_loader = self._create_data_loader('test')
-
         if len(test_loader.dataset) == 0:
             logger.warning("No test data found, skipping test")
             return
 
-        # Create output directory
         output_dir = Path(self.args.checkpoint_dir) / 'test_results'
         output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Test output directory: {output_dir}")
 
         # Load best checkpoint
         checkpoint_path = Path(self.args.checkpoint_dir) / 'best.pth'
         if checkpoint_path.exists():
-            logger.info(f"Loading checkpoint from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             self.interpolator.load_state_dict(checkpoint['interpolator_state_dict'])
-            logger.info("Checkpoint loaded successfully")
+            logger.info(f"Loaded checkpoint from {checkpoint_path}")
         else:
-            logger.warning(f"Checkpoint not found at {checkpoint_path}, using current model state")
+            logger.warning("Checkpoint not found, using current model state")
 
         self.interpolator.eval()
 
         # Process first test sample
         for batch_idx, batch in enumerate(test_loader):
-            if batch_idx > 0:  # Only process first sample
+            if batch_idx > 0:
                 break
 
             file_path = batch['file_path'][0]
-            logger.info(f"Processing file: {file_path}")
+            logger.info(f"Processing: {file_path}")
 
-            # 1. Load full 257 slices (0-256)
-            logger.info("Loading original 257 slices (0-256)...")
+            # Load full 257 slices
             full_slices = self._load_full_volume_slices(file_path, num_output_slices=257)
-            logger.info(f"Loaded full volume slices: {full_slices.shape}")
 
-            # 2. Save original 257 slices as images
+            # Save original slices
             original_dir = output_dir / 'original_257'
             original_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Saving original slices to {original_dir}...")
             for i, slice_data in enumerate(full_slices):
                 img = Image.fromarray((slice_data * 255).astype(np.uint8))
                 img.save(original_dir / f'slice_{i:03d}.png')
             logger.info(f"Saved {len(full_slices)} original slices")
 
-            # 3. Extract every other slice (0, 2, 4, ..., 256) = 129 slices
-            logger.info("Extracting 129 slices (0, 2, 4, ..., 256)...")
-            sampled_indices = np.arange(0, 257, 2)  # 0, 2, 4, ..., 256
-            sampled_slices = full_slices[sampled_indices]
-            logger.info(f"Extracted sampled slices: {sampled_slices.shape}")
-
-            # 4. Perform interpolation
-            logger.info("Performing interpolation...")
+            # Extract every other slice (129 slices)
+            sampled_slices = full_slices[::2]
             sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
+
+            # Interpolate
             with torch.no_grad():
                 interpolated_volume = self.interpolate_volume(sampled_tensor)
             interpolated_np = interpolated_volume[0].cpu().numpy()
-            logger.info(f"Interpolated volume shape: {interpolated_np.shape}")
 
-            # 5. Save interpolated 257 slices (129 original + 128 interpolated)
+            # Save interpolated slices
             interpolated_dir = output_dir / 'interpolated_257'
             interpolated_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Saving interpolated slices to {interpolated_dir}...")
             for i, slice_data in enumerate(interpolated_np):
-                # Normalize to [0, 1]
                 slice_norm = np.clip(slice_data, 0, 1)
                 img = Image.fromarray((slice_norm * 255).astype(np.uint8))
                 img.save(interpolated_dir / f'slice_{i:03d}.png')
             logger.info(f"Saved {len(interpolated_np)} interpolated slices")
 
-            logger.info(f"Test completed for sample {batch_idx}")
-            logger.info(f"Results saved to {output_dir}")
+            logger.info(f"Test complete. Results saved to {output_dir}")
 
-        logger.info("Testing complete!")
+        logger.info("Testing finished!")
 
 
 def main():
@@ -670,122 +566,50 @@ def main():
 
     parser = argparse.ArgumentParser(description='Train 3D Medical Image Interpolation')
 
-    # Single file mode
-    parser.add_argument('--single_file', type=str, default=None,
-                       help='Path to single DICOM file for training (enables single file mode)')
-
-    # Data settings
+    # Data
     parser.add_argument('--data_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/data',
-                       help='Data directory (ignored in single file mode)')
-    parser.add_argument('--num_slices', type=int, default=129,
-                       help='Number of slices to extract (will be interpolated to 256)')
-    parser.add_argument('--img_size', type=int, default=256,
-                       help='Image size (square)')
+                       help='Data directory')
+    parser.add_argument('--num_slices', type=int, default=129, help='Number of slices')
+    parser.add_argument('--img_size', type=int, default=256, help='Image size')
 
-    # Training settings
-    parser.add_argument('--batch_size', type=int, default=2,
-                       help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=50,
-                       help='Number of epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                       help='Learning rate')
+    # Training
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=1, help='Number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
 
-    # Model
-    parser.add_argument('--num_classes', type=int, default=2,
-                       help='Number of classes')
-    parser.add_argument('--vit_name', type=str, default='ViT-B_16',
-                       help='ViT model name')
-    parser.add_argument('--vit_patches_size', type=int, default=16,
-                       help='ViT patch size')
-    parser.add_argument('--n_skip', type=int, default=3,
-                       help='Number of skip connections')
+    # Optimizer & Loss
+    parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
+    parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
+    parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
+    parser.add_argument('--lambda_consistency', type=float, default=0.1, help='Consistency loss weight')
+    parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
 
-    # Training parameters
-    parser.add_argument('--min_lr', type=float, default=1e-6,
-                       help='Minimum learning rate')
-    parser.add_argument('--beta1', type=float, default=0.9,
-                       help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.999,
-                       help='Adam beta2')
-    parser.add_argument('--grad_clip', type=float, default=1.0,
-                       help='Gradient clipping value')
-
-    # Loss weights
-    parser.add_argument('--lambda_consistency', type=float, default=0.1,
-                       help='Multi-view consistency loss weight')
-    parser.add_argument('--lambda_smoothness', type=float, default=0.1,
-                       help='Smoothness regularization weight')
-    parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0,
-                       help='Ground truth interpolation loss weight')
-    parser.add_argument('--consistency_loss_type', type=str, default='dice',
-                       help='Consistency loss type (dice/ce/mse/combined)')
-    parser.add_argument('--interpolation_gt_loss_type', type=str, default='l1',
-                       help='Ground truth interpolation loss type (l1/l2/smooth_l1)')
-
-    # Checkpointing
+    # Checkpoint & Device
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
                        help='Checkpoint directory')
-    parser.add_argument('--save_interval', type=int, default=10,
-                       help='Save checkpoint interval')
-
-    # Logging
-    parser.add_argument('--log_interval', type=int, default=10,
-                       help='Logging interval')
-    parser.add_argument('--use_wandb', action='store_true',
-                       help='Enable wandb logging')
-    parser.add_argument('--project_name', type=str, default='medical-interpolation',
-                       help='Wandb project name')
-
-    # Hardware
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device (cuda/cpu)')
-    parser.add_argument('--cache_data', action='store_true',
-                       help='Cache preprocessed data')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loading workers')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
 
     args = parser.parse_args()
 
     # Convert img_size from int to tuple
     args.img_size = (args.img_size, args.img_size)
 
-    # Handle single file mode
-    if args.single_file:
-        logger.info(f"Running in SINGLE FILE MODE with: {args.single_file}")
-        args.single_file_mode = True
-        args.single_dicom_path = args.single_file
-        args.data_dir = "."
-        args.batch_size = 1
-        args.num_workers = 0
-        args.log_interval = 1
-    else:
-        logger.info("Running in NORMAL MODE with dataset directory")
-        args.single_file_mode = False
-        args.single_dicom_path = None
-
     # Check CUDA availability
     if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA not available, falling back to CPU")
+        logger.warning("CUDA not available, using CPU")
         args.device = "cpu"
 
     # Print config summary
-    logger.info("=" * 80)
-    logger.info("Training Configuration:")
-    logger.info("=" * 80)
-    if args.single_file_mode:
-        logger.info(f"Mode: Single File")
-        logger.info(f"DICOM file: {args.single_dicom_path}")
-    else:
-        logger.info(f"Mode: Dataset Directory")
-        logger.info(f"Data directory: {args.data_dir}")
-    logger.info(f"Number of slices: {args.num_slices}")
-    logger.info(f"Image size: {args.img_size}")
-    logger.info(f"Batch size: {args.batch_size}")
-    logger.info(f"Number of epochs: {args.num_epochs}")
-    logger.info(f"Learning rate: {args.learning_rate}")
-    logger.info(f"Device: {args.device}")
-    logger.info(f"Interpolator backbone: IFNet")
-    logger.info("=" * 80)
+    logger.info("-" * 80)
+    logger.info("TRAINING CONFIGURATION")
+    logger.info(f"  Data: {args.data_dir} | {args.num_slices} slices | Size: {args.img_size}")
+    logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
+    logger.info(f"  Models: Interpolator=IFNet | Segmentation=MONAI UNet (pretrained)")
+    logger.info(f"  Device: {args.device}")
+    logger.info("-" * 80)
 
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
