@@ -88,7 +88,6 @@ class TrainingPipeline:
         self.global_step = 0
         self.save_interval = 10
         self.log_interval = 10
-        self.lambda_interpolation_gt = 0.0
 
     def _create_data_loader(self, split: str) -> DataLoader:
         """Create data loader for train/val/test split"""
@@ -278,7 +277,7 @@ class TrainingPipeline:
         total_loss = (
             self.args.lambda_consistency * consistency_total +
             self.args.lambda_smoothness * smoothness +
-            self.lambda_interpolation_gt * interpolation_gt
+            self.args.lambda_interpolation_gt * interpolation_gt
         )
 
         loss_dict = {
@@ -343,6 +342,20 @@ class TrainingPipeline:
             loss_str = f"Total: {loss_dict['total']:.4f} | Consistency: {loss_dict['consistency']:.4f} | Smoothness: {loss_dict['smoothness']:.4f} | InterpolationGT: {loss_dict['interpolation_gt']:.4f}"
             pbar.set_postfix({'loss': loss_str}, refresh=True)
 
+            # Visualize first batch of training
+            if batch_idx == 0:
+                output_dir = Path(self.args.checkpoint_dir) / f'epoch_{epoch:03d}_train'
+                self.visualize_segmentation(
+                    slices[0],  # 原始切片 [N, H, W]
+                    interpolated_volume[0],  # 插值体积 [D, H, W]
+                    seg_axial[0],  # 轴向分割 [C, D, H, W]
+                    seg_sagittal[0],  # 矢状分割 [C, D, H, W]
+                    seg_coronal[0],  # 冠状分割 [C, D, H, W]
+                    output_dir=output_dir,
+                    epoch=epoch
+                )
+                logger.info(f"Saved training visualization at epoch {epoch}")
+
             self.global_step += 1
 
         # Average epoch metrics
@@ -386,6 +399,130 @@ class TrainingPipeline:
         }
 
         return avg_val_loss
+
+    def visualize_segmentation(self, original_slices, interpolated_volume, seg_axial,
+                              seg_sagittal, seg_coronal, output_dir: Path, epoch: int):
+        """
+        Visualize segmentation results from multiple views
+
+        Args:
+            original_slices: [N, H, W] - 原始输入切片
+            interpolated_volume: [D, H, W] - 插值后的体积
+            seg_axial: [C, D, H, W] - 轴向分割
+            seg_sagittal: [C, D, H, W] - 矢状分割
+            seg_coronal: [C, D, H, W] - 冠状分割
+            output_dir: 保存目录
+            epoch: 训练轮次
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 转换为 numpy
+        interp_np = interpolated_volume.cpu().detach().numpy()  # [D, H, W]
+        seg_axial_np = seg_axial.cpu().detach().numpy()  # [C, D, H, W]
+        seg_sag_np = seg_sagittal.cpu().detach().numpy()  # [C, D, H, W]
+        seg_cor_np = seg_coronal.cpu().detach().numpy()  # [C, D, H, W]
+        orig_slices_np = original_slices.cpu().detach().numpy()  # [N, H, W]
+
+        D, H, W = interp_np.shape
+
+        # ===== 1. 保存原始切片 =====
+        orig_dir = output_dir / '1_original_slices'
+        orig_dir.mkdir(exist_ok=True)
+        for i, slice_data in enumerate(orig_slices_np):
+            slice_norm = np.clip(slice_data, 0, 1)
+            img = Image.fromarray((slice_norm * 255).astype(np.uint8))
+            img.save(orig_dir / f'slice_{i:03d}.png')
+
+        # ===== 2. 保存插值体积 =====
+        interp_dir = output_dir / '2_interpolated_volume'
+        interp_dir.mkdir(exist_ok=True)
+        v_min, v_max = interp_np.min(), interp_np.max()
+        if v_max > v_min:
+            interp_norm = (interp_np - v_min) / (v_max - v_min) * 255
+        else:
+            interp_norm = interp_np * 255
+        for i in range(D):
+            img = Image.fromarray(interp_norm[i].astype(np.uint8))
+            img.save(interp_dir / f'frame_{i:03d}.png')
+
+        # ===== 3. 保存分割掩码 =====
+        def save_segmentation_view(seg_logits, view_name):
+            """保存某个视图的分割结果"""
+            view_dir = output_dir / f'3_masks_{view_name}'
+            view_dir.mkdir(exist_ok=True)
+
+            # argmax 得到类别预测
+            mask = np.argmax(seg_logits, axis=0)  # [D, H, W]
+
+            # 保存每一帧
+            for frame_idx in range(mask.shape[0]):
+                mask_frame = mask[frame_idx].astype(np.uint8) * 127
+                img = Image.fromarray(mask_frame)
+                img.save(view_dir / f'mask_{frame_idx:03d}.png')
+
+            # 保存 3D numpy
+            np.save(view_dir / f'mask_3d.npy', mask)
+            logger.info(f"Saved {view_name} masks to {view_dir}")
+
+        save_segmentation_view(seg_axial_np, 'axial')
+        save_segmentation_view(seg_sag_np, 'sagittal')
+        save_segmentation_view(seg_cor_np, 'coronal')
+
+        # ===== 4. 保存彩色叠加图 =====
+        def save_overlay(seg_logits, interp_vol, view_name):
+            """保存分割掩码与原始图像的叠加"""
+            overlay_dir = output_dir / f'4_overlay_{view_name}'
+            overlay_dir.mkdir(exist_ok=True)
+
+            # 获取前景概率
+            foreground_prob = np.exp(seg_logits[1]) / (np.exp(seg_logits[0]) + np.exp(seg_logits[1]))  # [D, H, W]
+
+            # 逐帧保存叠加
+            for frame_idx in range(interp_vol.shape[0]):
+                img_frame = (interp_vol[frame_idx] * 255).astype(np.uint8)
+                prob_frame = (foreground_prob[frame_idx] * 255).astype(np.uint8)
+
+                # 转换为 RGB
+                img_rgb = np.stack([img_frame, img_frame, img_frame], axis=-1)
+
+                # 创建热力图
+                heatmap = np.stack([
+                    np.zeros_like(prob_frame),  # R
+                    (prob_frame * 0.7).astype(np.uint8),  # G
+                    prob_frame  # B
+                ], axis=-1)
+
+                # 叠加
+                overlay = (0.5 * img_rgb + 0.5 * heatmap).astype(np.uint8)
+                img = Image.fromarray(overlay)
+                img.save(overlay_dir / f'overlay_{frame_idx:03d}.png')
+
+            logger.info(f"Saved {view_name} overlays to {overlay_dir}")
+
+        save_overlay(seg_axial_np, interp_np, 'axial')
+        save_overlay(seg_sag_np, interp_np, 'sagittal')
+        save_overlay(seg_cor_np, interp_np, 'coronal')
+
+        # ===== 5. 保存统计信息 =====
+        stats_file = output_dir / 'visualization_stats.txt'
+        with open(stats_file, 'w') as f:
+            f.write(f"Epoch: {epoch}\n")
+            f.write(f"Interpolated Volume Shape: {interp_np.shape}\n")
+            f.write(f"Interpolated Volume Range: [{v_min:.4f}, {v_max:.4f}]\n\n")
+
+            for view_name, seg_logits in [('Axial', seg_axial_np),
+                                         ('Sagittal', seg_sag_np),
+                                         ('Coronal', seg_cor_np)]:
+                mask = np.argmax(seg_logits, axis=0)
+                bg_count = (mask == 0).sum()
+                fg_count = (mask == 1).sum()
+                total = bg_count + fg_count
+                f.write(f"{view_name}:\n")
+                f.write(f"  Background: {bg_count} ({bg_count/total*100:.1f}%)\n")
+                f.write(f"  Foreground: {fg_count} ({fg_count/total*100:.1f}%)\n\n")
+
+        logger.info(f"Saved visualization stats to {stats_file}")
 
     def save_checkpoint(self, epoch: int, val_loss: float, is_best: bool = False):
         """Save model checkpoint"""
@@ -585,6 +722,7 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--lambda_consistency', type=float, default=0.1, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
+    parser.add_argument('--lambda_interpolation_gt', type=float, default=0.8, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
