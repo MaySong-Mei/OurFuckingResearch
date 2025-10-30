@@ -2,7 +2,7 @@
 3D Medical Image Interpolation Training Pipeline
 Self-Supervised Multi-View Consistency Approach
 
-Uses IFNet for interpolation and MONAI UNET for segmentation.
+Uses IFNet for interpolation and MedSam for segmentation.
 """
 
 import torch
@@ -711,7 +711,7 @@ def main():
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=1, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=5, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
 
@@ -720,9 +720,9 @@ def main():
     parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--lambda_consistency', type=float, default=0.1, help='Consistency loss weight')
+    parser.add_argument('--lambda_consistency', type=float, default=0.01, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
-    parser.add_argument('--lambda_interpolation_gt', type=float, default=0.8, help='Interpolation ground truth loss weight')
+    parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
@@ -745,7 +745,7 @@ def main():
     logger.info("TRAINING CONFIGURATION")
     logger.info(f"  Data: {args.data_dir} | {args.num_slices} slices | Size: {args.img_size}")
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
-    logger.info(f"  Models: Interpolator=IFNet | Segmentation=MONAI UNet (pretrained)")
+    logger.info(f"  Models: Interpolator=IFNet | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info("-" * 80)
 
