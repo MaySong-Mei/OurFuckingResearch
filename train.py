@@ -370,8 +370,8 @@ class TrainingPipeline:
             # Logging
             epoch_losses.append(loss_dict)
 
-            # Print detailed loss breakdown with metrics
-            loss_str = f"L:{loss_dict['total']:.4f} | C:{loss_dict['consistency']:.4f} | S:{loss_dict['smoothness']:.4f} | GT:{loss_dict['interpolation_gt']:.4f} | PSNR:{loss_dict['psnr']:.2f} | SSIM:{loss_dict['ssim']:.4f}"
+            # Print detailed loss breakdown (without per-sample metrics)
+            loss_str = f"L:{loss_dict['total']:.4f} | C:{loss_dict['consistency']:.4f} | S:{loss_dict['smoothness']:.4f} | GT:{loss_dict['interpolation_gt']:.4f}"
             pbar.set_postfix({'status': loss_str}, refresh=True)
 
             # Visualize first batch of training
@@ -404,7 +404,6 @@ class TrainingPipeline:
         self.interpolator.eval()
 
         val_losses = []
-        visualize_done = False
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc='Validation')):
             slices = batch['slices'].to(self.device)
@@ -586,16 +585,38 @@ class TrainingPipeline:
 
     def _log_losses(self, losses: dict, prefix: str, epoch: int):
         """Log loss dictionary with appropriate precision for each metric"""
-        msg = f"{prefix} Epoch {epoch}: "
-        metric_strs = []
+        # Separate metrics and performance metrics
+        loss_metrics = {}
+        perf_metrics = {}
+
         for k, v in losses.items():
-            if k in ['psnr']:
-                metric_strs.append(f"{k}={v:.2f}")
-            elif k in ['ssim']:
-                metric_strs.append(f"{k}={v:.4f}")
+            if k in ['psnr', 'ssim']:
+                perf_metrics[k] = v
             else:
-                metric_strs.append(f"{k}={v:.4f}")
-        msg += " | ".join(metric_strs)
+                loss_metrics[k] = v
+
+        # Log loss metrics
+        loss_strs = []
+        for k in ['total', 'consistency', 'consistency_sagittal', 'consistency_coronal', 'smoothness', 'interpolation_gt']:
+            if k in loss_metrics:
+                loss_strs.append(f"{k}={loss_metrics[k]:.4f}")
+
+        msg = f"\n{'='*80}\n"
+        msg += f"{prefix} Epoch {epoch:03d}\n"
+        msg += f"Losses: {' | '.join(loss_strs)}\n"
+
+        # Log performance metrics
+        if perf_metrics:
+            perf_strs = []
+            if 'psnr' in perf_metrics:
+                perf_strs.append(f"PSNR={perf_metrics['psnr']:.2f} dB")
+            if 'ssim' in perf_metrics:
+                perf_strs.append(f"SSIM={perf_metrics['ssim']:.4f}")
+
+            if perf_strs:
+                msg += f"Metrics: {' | '.join(perf_strs)}\n"
+
+        msg += f"{'='*80}"
         logger.info(msg)
 
     def train(self):
@@ -695,28 +716,32 @@ class TrainingPipeline:
 
         self.interpolator.eval()
 
-        # Process first test sample
-        for batch_idx, batch in enumerate(test_loader):
-            if batch_idx > 0:
-                break
+        # Track metrics across all test samples
+        test_metrics = {
+            'psnr': [],
+            'ssim': []
+        }
 
+        # Process all test samples
+        for batch_idx, batch in enumerate(test_loader):
             file_path = batch['file_path'][0]
-            logger.info(f"Processing: {file_path}")
+            logger.info(f"Processing test sample {batch_idx + 1}: {file_path}")
 
             # Load full 257 slices
             full_slices = self._load_full_volume_slices(file_path, num_output_slices=257)
 
             # Save original slices
-            original_dir = output_dir / 'original_257'
+            original_dir = output_dir / f'sample_{batch_idx:03d}/original_257'
             original_dir.mkdir(parents=True, exist_ok=True)
             for i, slice_data in enumerate(full_slices):
                 img = Image.fromarray((slice_data * 255).astype(np.uint8))
                 img.save(original_dir / f'slice_{i:03d}.png')
-            logger.info(f"Saved {len(full_slices)} original slices")
+            logger.info(f"  Saved {len(full_slices)} original slices")
 
             # Extract every other slice (129 slices)
             sampled_slices = full_slices[::2]
             sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
+            ground_truth_tensor = torch.from_numpy(full_slices[np.newaxis, :, :, :]).float().to(self.device)
 
             # Interpolate
             with torch.no_grad():
@@ -724,16 +749,34 @@ class TrainingPipeline:
             interpolated_np = interpolated_volume[0].cpu().numpy()
 
             # Save interpolated slices
-            interpolated_dir = output_dir / 'interpolated_257'
+            interpolated_dir = output_dir / f'sample_{batch_idx:03d}/interpolated_257'
             interpolated_dir.mkdir(parents=True, exist_ok=True)
             for i, slice_data in enumerate(interpolated_np):
                 slice_norm = np.clip(slice_data, 0, 1)
                 img = Image.fromarray((slice_norm * 255).astype(np.uint8))
                 img.save(interpolated_dir / f'slice_{i:03d}.png')
-            logger.info(f"Saved {len(interpolated_np)} interpolated slices")
+            logger.info(f"  Saved {len(interpolated_np)} interpolated slices")
 
-            logger.info(f"Test complete. Results saved to {output_dir}")
+            # Compute metrics for this sample
+            if ground_truth_tensor.shape[1] == interpolated_volume.shape[1]:
+                metrics = self.interpolation_gt_loss.compute_metrics(
+                    interpolated_volume, ground_truth_tensor
+                )
+                test_metrics['psnr'].append(metrics['psnr'])
+                test_metrics['ssim'].append(metrics['ssim'])
+                logger.info(f"  Sample {batch_idx + 1}: PSNR={metrics['psnr']:.2f} dB, SSIM={metrics['ssim']:.4f}")
 
+        # Log average test metrics
+        if test_metrics['psnr']:
+            avg_psnr = np.mean(test_metrics['psnr'])
+            avg_ssim = np.mean(test_metrics['ssim'])
+            logger.info("\n" + "="*80)
+            logger.info("TEST RESULTS (AVERAGE)")
+            logger.info(f"Average PSNR: {avg_psnr:.2f} dB")
+            logger.info(f"Average SSIM: {avg_ssim:.4f}")
+            logger.info("="*80)
+
+        logger.info(f"Test complete. Results saved to {output_dir}")
         logger.info("Testing finished!")
 
 
@@ -760,12 +803,12 @@ def main():
     parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--lambda_consistency', type=float, default=0.01, help='Consistency loss weight')
+    parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/original_checkpoints',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
