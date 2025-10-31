@@ -16,6 +16,7 @@ from datetime import datetime
 import numpy as np
 from PIL import Image
 import pydicom
+import random
 
 from data_loader import MedicalVolumeDataset
 from models.IFNet import IFNet
@@ -25,6 +26,30 @@ from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def set_random_seed(seed: int = 42):
+    """
+    Set random seed for reproducibility across all libraries.
+
+    Args:
+        seed: Random seed value (default: 42)
+    """
+    # Set seeds for different libraries
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Enable deterministic mode for CUDA operations
+    # Note: This may impact performance
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    logger.info(f"✓ Random seed set to {seed} for reproducibility")
+    logger.info(f"  - torch.backends.cudnn.deterministic = {torch.backends.cudnn.deterministic}")
+    logger.info(f"  - torch.backends.cudnn.benchmark = {torch.backends.cudnn.benchmark}")
 
 
 class TrainingPipeline:
@@ -264,13 +289,18 @@ class TrainingPipeline:
         # Smoothness regularization
         smoothness = self.smoothness_loss(interpolated_volume)
 
-        # Ground truth interpolation loss
+        # Ground truth interpolation loss and metrics
         interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
+        metrics = {'psnr': 0.0, 'ssim': 0.0}
         if ground_truth_slices is not None:
             # Set debug=True only for first batch of each epoch
             is_first_batch = getattr(self, '_is_first_batch', False)
             interpolation_gt = self.interpolation_gt_loss(
                 interpolated_volume, ground_truth_slices, debug=is_first_batch
+            )
+            # Compute PSNR and SSIM metrics
+            metrics = self.interpolation_gt_loss.compute_metrics(
+                interpolated_volume, ground_truth_slices
             )
 
         # Total weighted loss
@@ -286,7 +316,9 @@ class TrainingPipeline:
             'consistency_sagittal': consistency_sag.item(),
             'consistency_coronal': consistency_cor.item(),
             'smoothness': smoothness.item(),
-            'interpolation_gt': interpolation_gt.item() if isinstance(interpolation_gt, torch.Tensor) else interpolation_gt
+            'interpolation_gt': interpolation_gt.item() if isinstance(interpolation_gt, torch.Tensor) else interpolation_gt,
+            'psnr': metrics['psnr'],
+            'ssim': metrics['ssim']
         }
 
         return total_loss, loss_dict
@@ -338,9 +370,9 @@ class TrainingPipeline:
             # Logging
             epoch_losses.append(loss_dict)
 
-            # Print detailed loss breakdown
-            loss_str = f"Total: {loss_dict['total']:.4f} | Consistency: {loss_dict['consistency']:.4f} | Smoothness: {loss_dict['smoothness']:.4f} | InterpolationGT: {loss_dict['interpolation_gt']:.4f}"
-            pbar.set_postfix({'loss': loss_str}, refresh=True)
+            # Print detailed loss breakdown with metrics
+            loss_str = f"L:{loss_dict['total']:.4f} | C:{loss_dict['consistency']:.4f} | S:{loss_dict['smoothness']:.4f} | GT:{loss_dict['interpolation_gt']:.4f} | PSNR:{loss_dict['psnr']:.2f} | SSIM:{loss_dict['ssim']:.4f}"
+            pbar.set_postfix({'status': loss_str}, refresh=True)
 
             # Visualize first batch of training
             if batch_idx == 0:
@@ -553,9 +585,17 @@ class TrainingPipeline:
             torch.save(checkpoint, epoch_path)
 
     def _log_losses(self, losses: dict, prefix: str, epoch: int):
-        """Log loss dictionary"""
+        """Log loss dictionary with appropriate precision for each metric"""
         msg = f"{prefix} Epoch {epoch}: "
-        msg += " | ".join([f"{k}={v:.4f}" for k, v in losses.items()])
+        metric_strs = []
+        for k, v in losses.items():
+            if k in ['psnr']:
+                metric_strs.append(f"{k}={v:.2f}")
+            elif k in ['ssim']:
+                metric_strs.append(f"{k}={v:.4f}")
+            else:
+                metric_strs.append(f"{k}={v:.4f}")
+        msg += " | ".join(metric_strs)
         logger.info(msg)
 
     def train(self):
@@ -730,7 +770,13 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
 
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
     args = parser.parse_args()
+
+    # ✓ Set random seed BEFORE any model/data initialization
+    set_random_seed(args.seed)
 
     # Convert img_size from int to tuple
     args.img_size = (args.img_size, args.img_size)
@@ -747,6 +793,7 @@ def main():
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
     logger.info(f"  Models: Interpolator=IFNet | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
+    logger.info(f"  Reproducibility: seed={args.seed}")
     logger.info("-" * 80)
 
     # Create and run pipeline

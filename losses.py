@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class ConsistencyLoss(nn.Module):
@@ -73,6 +74,50 @@ class InterpolationGroundTruthLoss(nn.Module):
                ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
         return 1.0 - ssim.mean()
+
+    def _compute_ssim_metric(self, x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> float:
+        """Compute SSIM metric (higher is better)"""
+        B, N, H, W = x.shape
+        x_flat = x.reshape(B * N, 1, H, W)
+        y_flat = y.reshape(B * N, 1, H, W)
+
+        mu1 = F.avg_pool2d(x_flat, window_size, padding=window_size//2)
+        mu2 = F.avg_pool2d(y_flat, window_size, padding=window_size//2)
+
+        mu1_sq = mu1 ** 2
+        mu2_sq = mu2 ** 2
+        mu1_mu2 = mu1 * mu2
+
+        sigma1_sq = F.avg_pool2d(x_flat ** 2, window_size, padding=window_size//2) - mu1_sq
+        sigma2_sq = F.avg_pool2d(y_flat ** 2, window_size, padding=window_size//2) - mu2_sq
+        sigma12 = F.avg_pool2d(x_flat * y_flat, window_size, padding=window_size//2) - mu1_mu2
+
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+
+        ssim = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+        return ssim.mean().item()
+
+    def _compute_psnr(self, x: torch.Tensor, y: torch.Tensor, max_val: float = 1.0) -> float:
+        """Compute PSNR metric"""
+        mse = F.mse_loss(x, y)
+        if mse == 0:
+            return float('inf')
+        psnr = 20 * math.log10(max_val / (torch.sqrt(mse).item()))
+        return psnr
+
+    def compute_metrics(self, interpolated_volume: torch.Tensor,
+                       ground_truth_slices: torch.Tensor) -> dict:
+        """Compute PSNR and SSIM metrics"""
+        interpolated_intermediate = interpolated_volume[:, 1::2, :, :]
+        ground_truth_intermediate = ground_truth_slices[:, 1::2, :, :]
+
+        psnr = self._compute_psnr(interpolated_intermediate, ground_truth_intermediate)
+        ssim = self._compute_ssim_metric(interpolated_intermediate, ground_truth_intermediate)
+
+        return {'psnr': psnr, 'ssim': ssim}
 
     def forward(self, interpolated_volume: torch.Tensor,
                 ground_truth_slices: torch.Tensor, debug: bool = False) -> torch.Tensor:
