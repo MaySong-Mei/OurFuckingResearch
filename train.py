@@ -293,15 +293,24 @@ class TrainingPipeline:
         interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
         metrics = {'psnr': 0.0, 'ssim': 0.0}
         if ground_truth_slices is not None:
+            # Align ground truth to match interpolated volume size
+            # ground_truth_slices: [B, 257, H, W] -> take first 256 slices
+            ground_truth_aligned = ground_truth_slices[:, :256, :, :]
+
             # Set debug=True only for first batch of each epoch
             is_first_batch = getattr(self, '_is_first_batch', False)
-            interpolation_gt = self.interpolation_gt_loss(
-                interpolated_volume, ground_truth_slices, debug=is_first_batch
-            )
-            # Compute PSNR and SSIM metrics
-            metrics = self.interpolation_gt_loss.compute_metrics(
-                interpolated_volume, ground_truth_slices
-            )
+            try:
+                interpolation_gt = self.interpolation_gt_loss(
+                    interpolated_volume, ground_truth_aligned, debug=is_first_batch
+                )
+                # Compute PSNR and SSIM metrics
+                metrics = self.interpolation_gt_loss.compute_metrics(
+                    interpolated_volume, ground_truth_aligned
+                )
+            except Exception as e:
+                logger.warning(f"Failed to compute ground truth loss and metrics: {e}")
+                interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
+                metrics = {'psnr': 0.0, 'ssim': 0.0}
 
         # Total weighted loss
         total_loss = (
@@ -370,8 +379,13 @@ class TrainingPipeline:
             # Logging
             epoch_losses.append(loss_dict)
 
-            # Print detailed loss breakdown (without per-sample metrics)
+            # Print detailed loss breakdown with metrics
             loss_str = f"L:{loss_dict['total']:.4f} | C:{loss_dict['consistency']:.4f} | S:{loss_dict['smoothness']:.4f} | GT:{loss_dict['interpolation_gt']:.4f}"
+
+            # Add PSNR/SSIM if available
+            if loss_dict['psnr'] > 0:
+                loss_str += f" | PSNR:{loss_dict['psnr']:.2f}dB | SSIM:{loss_dict['ssim']:.4f}"
+
             pbar.set_postfix({'status': loss_str}, refresh=True)
 
             # Visualize first batch of training
@@ -718,6 +732,8 @@ class TrainingPipeline:
 
         # Track metrics across all test samples
         test_metrics = {
+            'sample_id': [],
+            'file_path': [],
             'psnr': [],
             'ssim': []
         }
@@ -741,7 +757,10 @@ class TrainingPipeline:
             # Extract every other slice (129 slices)
             sampled_slices = full_slices[::2]
             sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
-            ground_truth_tensor = torch.from_numpy(full_slices[np.newaxis, :, :, :]).float().to(self.device)
+
+            # Use 256 slices from ground truth (matching interpolated output)
+            ground_truth_slices_256 = full_slices[:256]
+            ground_truth_tensor = torch.from_numpy(ground_truth_slices_256[np.newaxis, :, :, :]).float().to(self.device)
 
             # Interpolate
             with torch.no_grad():
@@ -749,7 +768,7 @@ class TrainingPipeline:
             interpolated_np = interpolated_volume[0].cpu().numpy()
 
             # Save interpolated slices
-            interpolated_dir = output_dir / f'sample_{batch_idx:03d}/interpolated_257'
+            interpolated_dir = output_dir / f'sample_{batch_idx:03d}/interpolated_256'
             interpolated_dir.mkdir(parents=True, exist_ok=True)
             for i, slice_data in enumerate(interpolated_np):
                 slice_norm = np.clip(slice_data, 0, 1)
@@ -759,22 +778,108 @@ class TrainingPipeline:
 
             # Compute metrics for this sample
             if ground_truth_tensor.shape[1] == interpolated_volume.shape[1]:
-                metrics = self.interpolation_gt_loss.compute_metrics(
-                    interpolated_volume, ground_truth_tensor
-                )
-                test_metrics['psnr'].append(metrics['psnr'])
-                test_metrics['ssim'].append(metrics['ssim'])
-                logger.info(f"  Sample {batch_idx + 1}: PSNR={metrics['psnr']:.2f} dB, SSIM={metrics['ssim']:.4f}")
+                try:
+                    metrics = self.interpolation_gt_loss.compute_metrics(
+                        interpolated_volume, ground_truth_tensor
+                    )
+                    psnr_val = metrics['psnr']
+                    ssim_val = metrics['ssim']
 
-        # Log average test metrics
+                    # Record metrics
+                    test_metrics['sample_id'].append(batch_idx)
+                    test_metrics['file_path'].append(Path(file_path).name)
+                    test_metrics['psnr'].append(psnr_val)
+                    test_metrics['ssim'].append(ssim_val)
+
+                    logger.info(f"  Sample {batch_idx + 1}: PSNR={psnr_val:.2f} dB, SSIM={ssim_val:.4f}")
+                except Exception as e:
+                    logger.error(f"  Failed to compute metrics: {e}")
+            else:
+                logger.warning(f"  Shape mismatch: GT {ground_truth_tensor.shape[1]} vs Interp {interpolated_volume.shape[1]}")
+
+        # Save metrics to CSV
         if test_metrics['psnr']:
-            avg_psnr = np.mean(test_metrics['psnr'])
-            avg_ssim = np.mean(test_metrics['ssim'])
+            import csv
+
+            metrics_file = output_dir / 'test_metrics.csv'
+            with open(metrics_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Sample ID', 'File Path', 'PSNR (dB)', 'SSIM'])
+                for i, sample_id in enumerate(test_metrics['sample_id']):
+                    writer.writerow([
+                        sample_id,
+                        test_metrics['file_path'][i],
+                        f"{test_metrics['psnr'][i]:.2f}",
+                        f"{test_metrics['ssim'][i]:.4f}"
+                    ])
+            logger.info(f"Saved per-sample metrics to {metrics_file}")
+
+            # Compute statistics
+            psnr_values = np.array(test_metrics['psnr'])
+            ssim_values = np.array(test_metrics['ssim'])
+
+            avg_psnr = np.mean(psnr_values)
+            std_psnr = np.std(psnr_values)
+            min_psnr = np.min(psnr_values)
+            max_psnr = np.max(psnr_values)
+
+            avg_ssim = np.mean(ssim_values)
+            std_ssim = np.std(ssim_values)
+            min_ssim = np.min(ssim_values)
+            max_ssim = np.max(ssim_values)
+
+            # Log detailed test results
             logger.info("\n" + "="*80)
-            logger.info("TEST RESULTS (AVERAGE)")
-            logger.info(f"Average PSNR: {avg_psnr:.2f} dB")
-            logger.info(f"Average SSIM: {avg_ssim:.4f}")
+            logger.info("TEST RESULTS - PER-SAMPLE METRICS")
             logger.info("="*80)
+            for i, sample_id in enumerate(test_metrics['sample_id']):
+                logger.info(f"Sample {sample_id}: {test_metrics['file_path'][i]}")
+                logger.info(f"  PSNR: {test_metrics['psnr'][i]:.2f} dB")
+                logger.info(f"  SSIM: {test_metrics['ssim'][i]:.4f}")
+
+            logger.info("\n" + "="*80)
+            logger.info("TEST RESULTS - STATISTICS")
+            logger.info("="*80)
+            logger.info(f"PSNR Statistics (dB):")
+            logger.info(f"  Mean:   {avg_psnr:.2f}")
+            logger.info(f"  Std:    {std_psnr:.2f}")
+            logger.info(f"  Min:    {min_psnr:.2f}")
+            logger.info(f"  Max:    {max_psnr:.2f}")
+            logger.info(f"\nSSIM Statistics:")
+            logger.info(f"  Mean:   {avg_ssim:.4f}")
+            logger.info(f"  Std:    {std_ssim:.4f}")
+            logger.info(f"  Min:    {min_ssim:.4f}")
+            logger.info(f"  Max:    {max_ssim:.4f}")
+            logger.info(f"\nTotal samples: {len(test_metrics['psnr'])}")
+            logger.info("="*80)
+
+            # Save summary to text file
+            summary_file = output_dir / 'test_summary.txt'
+            with open(summary_file, 'w') as f:
+                f.write("="*80 + "\n")
+                f.write("TEST RESULTS - PER-SAMPLE METRICS\n")
+                f.write("="*80 + "\n")
+                for i, sample_id in enumerate(test_metrics['sample_id']):
+                    f.write(f"Sample {sample_id}: {test_metrics['file_path'][i]}\n")
+                    f.write(f"  PSNR: {test_metrics['psnr'][i]:.2f} dB\n")
+                    f.write(f"  SSIM: {test_metrics['ssim'][i]:.4f}\n")
+
+                f.write("\n" + "="*80 + "\n")
+                f.write("TEST RESULTS - STATISTICS\n")
+                f.write("="*80 + "\n")
+                f.write(f"PSNR Statistics (dB):\n")
+                f.write(f"  Mean:   {avg_psnr:.2f}\n")
+                f.write(f"  Std:    {std_psnr:.2f}\n")
+                f.write(f"  Min:    {min_psnr:.2f}\n")
+                f.write(f"  Max:    {max_psnr:.2f}\n")
+                f.write(f"\nSSIM Statistics:\n")
+                f.write(f"  Mean:   {avg_ssim:.4f}\n")
+                f.write(f"  Std:    {std_ssim:.4f}\n")
+                f.write(f"  Min:    {min_ssim:.4f}\n")
+                f.write(f"  Max:    {max_ssim:.4f}\n")
+                f.write(f"\nTotal samples: {len(test_metrics['psnr'])}\n")
+                f.write("="*80 + "\n")
+            logger.info(f"Saved test summary to {summary_file}")
 
         logger.info(f"Test complete. Results saved to {output_dir}")
         logger.info("Testing finished!")
