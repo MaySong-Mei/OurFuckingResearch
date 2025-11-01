@@ -913,7 +913,7 @@ def main():
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/original_checkpoints',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -946,7 +946,7 @@ def main():
 
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
-    # pipeline.train()
+    pipeline.train()
     pipeline.test()
 
 
