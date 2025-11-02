@@ -17,6 +17,8 @@ class ConsistencyLoss(nn.Module):
         pred1_prob = F.softmax(pred1, dim=-1)
         pred2_prob = F.softmax(pred2, dim=-1)
 
+        print(f"pred_prob shape: {pred1_prob.shape}")
+
         # Flatten spatial dimensions
         pred1_flat = pred1_prob.reshape(-1, pred1.shape[-1])
         pred2_flat = pred2_prob.reshape(-1, pred2.shape[-1])

@@ -2,7 +2,7 @@
 3D Medical Image Interpolation Training Pipeline
 Self-Supervised Multi-View Consistency Approach
 
-Uses I3Net for interpolation and MedSam for segmentation.
+Uses Saint for interpolation and MedSam for segmentation.
 """
 
 import torch
@@ -29,15 +29,10 @@ sys.path.insert(0, _current_dir)
 
 # Now import local modules
 from data_loader import MedicalVolumeDataset
-from models.I3NetAdapter import I3NetInterpolator
+from models.saint_adapter import SaintInterpolator
 from models.medsam_infer import MedSAM2Segmenter
 
-# After I3NetAdapter import adds I3Net to path, restore original order for losses import
-sys.path = [p for p in sys.path if 'I3Net' not in p]
-sys.path.insert(0, _current_dir)
-
 from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -75,7 +70,7 @@ class TrainingPipeline:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize models
-        self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
+        self.interpolator = SaintInterpolator(upscale=2, device=str(self.device))
 
         # Initialize MedSAM2 for 3D segmentation
         logger.info("Using MedSAM2 for 3D segmentation")
@@ -397,11 +392,11 @@ class TrainingPipeline:
             if batch_idx == 0:
                 output_dir = Path(self.args.checkpoint_dir) / f'epoch_{epoch:03d}_train'
                 self.visualize_segmentation(
-                    slices[0],  # 原始切片 [N, H, W]
-                    interpolated_volume[0],  # 插值体积 [D, H, W]
-                    seg_axial[0],  # 轴向分割 [C, D, H, W]
-                    seg_sagittal[0],  # 矢状分割 [C, D, H, W]
-                    seg_coronal[0],  # 冠状分割 [C, D, H, W]
+                    slices[0],
+                    interpolated_volume[0],
+                    seg_axial[0],
+                    seg_sagittal[0],
+                    seg_coronal[0],
                     output_dir=output_dir,
                     epoch=epoch
                 )

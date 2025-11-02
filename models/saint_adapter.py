@@ -8,7 +8,7 @@ import torch.nn as nn
 from .meta_multi import FUSE_RDN
 
 
-class I3NetInterpolator(nn.Module):
+class SaintInterpolator(nn.Module):
     """
     Adapter for FUSE_RDN from meta_multi.py
     Takes 2 grayscale images and produces 1 interpolated frame
@@ -19,7 +19,7 @@ class I3NetInterpolator(nn.Module):
     """
 
     def __init__(self, upscale=2, device='cuda'):
-        super(I3NetInterpolator, self).__init__()
+        super(SaintInterpolator, self).__init__()
         self.device = device
         self.upscale = upscale
 
