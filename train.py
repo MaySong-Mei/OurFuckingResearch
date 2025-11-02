@@ -2,7 +2,7 @@
 3D Medical Image Interpolation Training Pipeline
 Self-Supervised Multi-View Consistency Approach
 
-Uses IFNet for interpolation and MedSam for segmentation.
+Uses I3Net for interpolation and MedSam for segmentation.
 """
 
 import torch
@@ -18,9 +18,24 @@ from PIL import Image
 import pydicom
 import random
 
+import sys
+from pathlib import Path
+
+# Setup paths - current directory takes priority
+_current_dir = str(Path(__file__).parent)
+if _current_dir in sys.path:
+    sys.path.remove(_current_dir)
+sys.path.insert(0, _current_dir)
+
+# Now import local modules
 from data_loader import MedicalVolumeDataset
-from models.IFNet import IFNet
+from models.I3NetAdapter import I3NetInterpolator
 from models.medsam_infer import MedSAM2Segmenter
+
+# After I3NetAdapter import adds I3Net to path, restore original order for losses import
+sys.path = [p for p in sys.path if 'I3Net' not in p]
+sys.path.insert(0, _current_dir)
+
 from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
 
 
@@ -60,7 +75,7 @@ class TrainingPipeline:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize models
-        self.interpolator = IFNet().to(self.device)
+        self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
 
         # Initialize MedSAM2 for 3D segmentation
         logger.info("Using MedSAM2 for 3D segmentation")
@@ -133,7 +148,7 @@ class TrainingPipeline:
 
     def interpolate_volume(self, slices: torch.Tensor) -> torch.Tensor:
         """
-        Interpolate between slices to create denser volume using IFNet
+        Interpolate between slices to create denser volume using I3Net
         Takes 129 slices and interpolates to 256 slices
 
         Args:
@@ -144,7 +159,7 @@ class TrainingPipeline:
         """
         batch_size, num_slices, H, W = slices.shape
 
-        # First use IFNet to do 2x interpolation: 129 -> 257 slices
+        # I3Net does 2x interpolation: 129 -> 257 slices
         # For 2x interpolation: N' = 2*N - 1
         interpolated_slices = [slices[:, 0:1]]  # Keep dimension [B, 1, H, W]
 
@@ -153,23 +168,13 @@ class TrainingPipeline:
             frame0 = slices[:, i:i+1]  # [B, 1, H, W]
             frame1 = slices[:, i+1:i+2]  # [B, 1, H, W]
 
-            # IFNet expects [B, 6, H, W] input (concatenated RGB images)
-            # Convert grayscale to 3-channel by repeating
-            frame0_rgb = frame0.repeat(1, 3, 1, 1)  # [B, 3, H, W]
-            frame1_rgb = frame1.repeat(1, 3, 1, 1)  # [B, 3, H, W]
+            # I3Net expects [B, 2, H, W] input (two consecutive grayscale slices)
+            i3net_input = torch.cat([frame0, frame1], dim=1)  # [B, 2, H, W]
 
-            # Concatenate along channel dimension
-            ifnet_input = torch.cat([frame0_rgb, frame1_rgb], dim=1)  # [B, 6, H, W]
-
-            # Interpolate middle frame(s)
+            # Interpolate middle frame
             with torch.set_grad_enabled(self.interpolator.training):
-                # IFNet returns: (flow_list, mask, merged, flow_teacher, merged_teacher, loss_distill)
-                # merged is a list of 3 frames, merged[2] is the final refined output
-                _, _, merged = self.interpolator(ifnet_input)
-                middle_frame_rgb = merged[2]  # [B, 3, H, W]
-
-                # Convert back to grayscale by averaging channels
-                middle_frame = middle_frame_rgb.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+                # I3Net returns [B, 1, H, W] - the interpolated middle frame
+                middle_frame = self.interpolator(i3net_input)  # [B, 1, H, W]
 
             interpolated_slices.append(middle_frame)
             interpolated_slices.append(frame1)
@@ -908,12 +913,12 @@ def main():
     parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
+    parser.add_argument('--lambda_consistency', type=float, default=0.01, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/original_checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/I3Net_checkpoints',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -939,7 +944,7 @@ def main():
     logger.info("TRAINING CONFIGURATION")
     logger.info(f"  Data: {args.data_dir} | {args.num_slices} slices | Size: {args.img_size}")
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
-    logger.info(f"  Models: Interpolator=IFNet | Segmentation=MedSam (pretrained)")
+    logger.info(f"  Models: Interpolator=I3Net | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Reproducibility: seed={args.seed}")
     logger.info("-" * 80)
