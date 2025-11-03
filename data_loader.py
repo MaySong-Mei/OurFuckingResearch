@@ -156,6 +156,8 @@ class MedicalVolumeDataset(Dataset):
             ground_truth_slices: [7, H, W] - 7 ground truth slices
         """
         volume = volume.transpose(2, 0, 1) # [H, W, D] -> [D, H, W]
+        # Downsampling
+        volume = zoom(volume, (1.0, 0.5, 0.5), order=1)
         num_slices_available = volume.shape[0]
 
         indices = np.arange(0, num_slices_available, 2)[:4]  # Every 2nd slice, take first 4

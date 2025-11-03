@@ -41,7 +41,7 @@ class I3NetInterpolator(nn.Module):
         self.args.upscale = upscale
 
         self.model = I3Net(self.args).to(device)
-        self.target_size = 256
+        # self.target_size = 256
 
     def forward(self, x):
         """
@@ -56,15 +56,15 @@ class I3NetInterpolator(nn.Module):
         B, C, H, W = x.shape
         original_size = (H, W)
 
-        # Downsample to 256x256 if needed (I3Net is optimized for this size)
-        if H != self.target_size or W != self.target_size:
-            x_resized = F.interpolate(x, size=(self.target_size, self.target_size), mode='bilinear', align_corners=False)
-        else:
-            x_resized = x
+        # # Downsample to 256x256 if needed (I3Net is optimized for this size)
+        # if H != self.target_size or W != self.target_size:
+        #     x_resized = F.interpolate(x, size=(self.target_size, self.target_size), mode='bilinear', align_corners=False)
+        # else:
+        #     x_resized = x
 
         # Convert format: [B, 4, 256, 256] -> [B, 256, 256, 4]
         # I3Net expects [B, H, W, D] format
-        x_i3net = x_resized.permute(0, 2, 3, 1).contiguous()  # [B, 256, 256, 4]
+        x_i3net = x.permute(0, 2, 3, 1).contiguous()  # [B, 256, 256, 4]
 
         # Forward through I3Net
 
@@ -73,9 +73,9 @@ class I3NetInterpolator(nn.Module):
         # Convert back to [B, 7, 256, 256]
         output = output_i3net.permute(0, 3, 1, 2).contiguous()  # [B, 7, 256, 256]
 
-        # Upsample back to original size if needed
-        if original_size != (self.target_size, self.target_size):
-            output = F.interpolate(output, size=original_size, mode='bilinear', align_corners=False)
+        # # Upsample back to original size if needed
+        # if original_size != (self.target_size, self.target_size):
+        #     output = F.interpolate(output, size=original_size, mode='bilinear', align_corners=False)
 
         return output
 
