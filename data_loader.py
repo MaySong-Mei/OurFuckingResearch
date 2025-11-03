@@ -147,32 +147,23 @@ class MedicalVolumeDataset(Dataset):
 
     def _extract_slices(self, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Extract slices from volume:
-        1. Sampled slices: every 2nd slice
-        2. Ground truth slices: all consecutive slices
-        3. Limit sampled slices to max_slices to avoid OOM
+        Extract slices from volume for I3Net (4 input -> 7 output):
+        1. Sampled slices: 4 slices sampled from volume
+        2. Ground truth slices: 7 consecutive slices (4*2-1)
 
         Returns:
-            slices: [D, H, W] - sampled slices
-            ground_truth_slices: [2D-1, H, W] - ground truth slices
+            slices: [4, H, W] - 4 sampled slices
+            ground_truth_slices: [7, H, W] - 7 ground truth slices
         """
         volume = volume.transpose(2, 0, 1) # [H, W, D] -> [D, H, W]
         num_slices_available = volume.shape[0]
 
-        # Sample with step of 2 (every other slice: 0, 2, 4, 6, ...)
-        indices = np.arange(0, num_slices_available, 2)
-        sampled_slices = volume[indices]
-        num_sampled_slices = sampled_slices.shape[0]
+        indices = np.arange(0, num_slices_available, 2)[:4]  # Every 2nd slice, take first 4
 
-        # Limit to max_slices to avoid OOM during interpolation
-        if num_sampled_slices > self.max_slices:
-            sampled_slices = sampled_slices[:self.max_slices]
-            num_sampled_slices = self.max_slices
+        sampled_slices = volume[indices]  # [4, H, W]
 
-        # Ground truth: use the limited sampled slices to compute GT size
-        num_gt_slices = 2 * num_sampled_slices - 1
-        # But GT should come from the original volume (first num_gt_slices from original)
-        ground_truth_slices = volume[:num_gt_slices]
+
+        ground_truth_slices = volume[:7]  # 7 consecutive slices
 
         # Normalize intensities
         sampled_slices = self._normalize_intensity(sampled_slices)

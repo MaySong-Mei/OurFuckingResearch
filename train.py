@@ -29,7 +29,7 @@ sys.path.insert(0, _current_dir)
 
 # Now import local modules
 from data_loader import MedicalVolumeDataset
-from models.saint_adapter import SaintInterpolator
+from models.i3net_adapter import I3NetInterpolator
 from models.medsam_infer import MedSAM2Segmenter
 
 from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
@@ -70,7 +70,7 @@ class TrainingPipeline:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize models
-        self.interpolator = SaintInterpolator(upscale=2, device=str(self.device))
+        self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
 
         # Initialize MedSAM2 for 3D segmentation
         logger.info("Using MedSAM2 for 3D segmentation")
@@ -142,39 +142,20 @@ class TrainingPipeline:
 
     def interpolate_volume(self, slices: torch.Tensor) -> torch.Tensor:
         """
-        Interpolate between slices to create denser volume using Saint
+        Interpolate volume using I3Net (4 input slices -> 7 output slices)
 
         Args:
-            slices: [B, D, H, W] - sampled slices
+            slices: [B, 4, H, W] - 4 sampled slices
 
         Returns:
-            interpolated: [B, 2D-1, H, W] - densely interpolated slices
+            interpolated: [B, 7, H, W] - interpolated slices
         """
         batch_size, num_slices, H, W = slices.shape
 
-        # For 2x interpolation: N' = 2*N - 1
-        # Pattern: [s0, m01, s1, m12, s2, ..., s(D-1)]
-        interpolated_slices = [slices[:, 0:1]]  # Start with first slice [B, 1, H, W]
-
-        for i in range(num_slices - 1):
-            # Get consecutive slice pairs
-            frame0 = slices[:, i:i+1]  # [B, 1, H, W]
-            frame1 = slices[:, i+1:i+2]  # [B, 1, H, W]
-
-            saint_input = torch.cat([frame0, frame1], dim=1)  # [B, 2, H, W]
-
-            # Interpolate middle frame
-            with torch.set_grad_enabled(self.interpolator.training):
-                # Saint returns [B, 1, H, W] - the interpolated middle frame
-                middle_frame = self.interpolator(saint_input)  # [B, 1, H, W]
-
-            # Append interpolated middle frame and next original frame
-            interpolated_slices.append(middle_frame)
-            interpolated_slices.append(frame1)
-
-        # Stack all slices: D original + (D-1) interpolated = 2D-1 total
-        # Note: frame1 is already appended in the last loop iteration, no need to append again
-        interpolated = torch.cat(interpolated_slices, dim=1)  # [B, 2D-1, H, W]
+        # I3Net: 4 sampled slices -> 7 output slices directly
+        # Pattern: [s0, s1, s2, s3] -> [s0, m01, s1, m12, s2, m23, s3]
+        with torch.set_grad_enabled(self.interpolator.training):
+            interpolated = self.interpolator(slices)  # [B, 7, H, W]
 
         return interpolated
 
@@ -834,7 +815,7 @@ def main():
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=5, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=10, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
 
@@ -871,7 +852,7 @@ def main():
     logger.info("TRAINING CONFIGURATION")
     logger.info(f"  Data: {args.data_dir} (max_slices={args.max_slices})")
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
-    logger.info(f"  Models: Interpolator=Saint | Segmentation=MedSam (pretrained)")
+    logger.info(f"  Models: Interpolator=I3Net | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Reproducibility: seed={args.seed}")
     logger.info("-" * 80)
