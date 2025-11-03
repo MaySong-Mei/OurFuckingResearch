@@ -28,7 +28,7 @@ if _current_dir in sys.path:
 sys.path.insert(0, _current_dir)
 
 # Now import local modules
-from data_loader import MedicalVolumeDataset
+from data_loader import MedicalVolumeDataset, load_and_normalize_volume
 from models.saint_adapter import SaintInterpolator
 from models.medsam_infer import MedSAM2Segmenter
 
@@ -128,9 +128,7 @@ class TrainingPipeline:
         """Create data loader for train/val/test split"""
         dataset = MedicalVolumeDataset(
             data_dir=self.args.data_dir,
-            split=split,
-            num_slices=self.args.num_slices,
-            img_size=self.args.img_size
+            split=split
         )
 
         return DataLoader(
@@ -143,18 +141,16 @@ class TrainingPipeline:
 
     def interpolate_volume(self, slices: torch.Tensor) -> torch.Tensor:
         """
-        Interpolate between slices to create denser volume using I3Net
-        Takes 129 slices and interpolates to 256 slices
+        Interpolate between slices to create denser volume using Saint
 
         Args:
-            slices: [B, 129, H, W] - batch of 129 original slices
+            slices: [B, D, H, W]
 
         Returns:
-            interpolated: [B, 256, H, W] - batch of 256 interpolated slices
+            interpolated: [B, 2D-1, H, W]
         """
         batch_size, num_slices, H, W = slices.shape
 
-        # I3Net does 2x interpolation: 129 -> 257 slices
         # For 2x interpolation: N' = 2*N - 1
         interpolated_slices = [slices[:, 0:1]]  # Keep dimension [B, 1, H, W]
 
@@ -163,22 +159,19 @@ class TrainingPipeline:
             frame0 = slices[:, i:i+1]  # [B, 1, H, W]
             frame1 = slices[:, i+1:i+2]  # [B, 1, H, W]
 
-            # I3Net expects [B, 2, H, W] input (two consecutive grayscale slices)
-            i3net_input = torch.cat([frame0, frame1], dim=1)  # [B, 2, H, W]
+            saint_input = torch.cat([frame0, frame1], dim=1)  # [B, 2, H, W]
 
             # Interpolate middle frame
             with torch.set_grad_enabled(self.interpolator.training):
-                # I3Net returns [B, 1, H, W] - the interpolated middle frame
-                middle_frame = self.interpolator(i3net_input)  # [B, 1, H, W]
+                # Saint returns [B, 1, H, W] - the interpolated middle frame
+                middle_frame = self.interpolator(saint_input)  # [B, 1, H, W]
 
             interpolated_slices.append(middle_frame)
             interpolated_slices.append(frame1)
 
-        # Stack all slices: 129 -> 257 slices
-        interpolated = torch.cat(interpolated_slices, dim=1)  # [B, 257, H, W]
-
-        # Drop the last frame to get exactly 256 slices
-        interpolated = interpolated[:, :256, :, :]  # [B, 256, H, W]
+        # Stack all slices: D -> 2D-1 slices
+        interpolated_slices.append(slices[:, -1:])  # Append last original slice
+        interpolated = torch.cat(interpolated_slices, dim=1)  # [B, 2D-1, H, W]
 
         return interpolated
 
@@ -188,31 +181,31 @@ class TrainingPipeline:
         Segment axial view, sagittal view, and coronal view independently
 
         Args:
-            volume: [B, 256, 256, 256] - 3D interpolated volume
+            volume: [B, 2D-1, H, W] - 3D interpolated volume
 
         Returns:
-            seg_axial: [B, C, 256, 256, 256] - axial view segmentation (3D)
-            seg_sagittal: [B, C, 256, 256, 256] - sagittal view segmentation (3D)
-            seg_coronal: [B, C, 256, 256, 256] - coronal view segmentation (3D)
+            seg_axial: [B, C, 2D-1, H, W] - axial view segmentation (3D)
+            seg_sagittal: [B, C, H, W, 2D-1] - sagittal view segmentation (3D)
+            seg_coronal: [B, C, W, 2D-1, H] - coronal view segmentation (3D)
         """
         B = volume.shape[0]
 
-        # Add channel dimension: [B, 256, 256, 256] -> [B, 1, 256, 256, 256]
+        # Add channel dimension: [B, 2D-1, H, W] -> [B, 1, 2D-1, H, W]
         volume_3d = volume.unsqueeze(1)
 
         with torch.no_grad():
             # Axial view: segment original volume (looking along Z-axis)
-            seg_axial = self.segmentation(volume_3d)  # [B, C, 256, 256, 256]
+            seg_axial = self.segmentation(volume_3d)  # [B, C, 2D-1, H, W]
 
             # Sagittal view: permute and segment (looking along X-axis)
-            # [B, 1, 256, 256, 256] -> [B, 1, 256, 256, 256] (rearrange to x-axis view)
-            vol_sagittal = volume.permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, 256, 256, 256]
-            seg_sagittal = self.segmentation(vol_sagittal)  # [B, C, 256, 256, 256]
+            # [B, 1, 2D-1, H, W] -> [B, 1, H, W, 2D-1] (rearrange to x-axis view)
+            vol_sagittal = volume.permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, H, W, 2D-1]
+            seg_sagittal = self.segmentation(vol_sagittal)  # [B, C, H, W, 2D-1]
 
             # Coronal view: permute and segment (looking along Y-axis)
-            # [B, 256, 256, 256] -> [B, 1, 256, 256, 256] (rearrange to y-axis view)
-            vol_coronal = volume.permute(0, 2, 3, 1).unsqueeze(1)  # [B, 1, 256, 256, 256]
-            seg_coronal = self.segmentation(vol_coronal)  # [B, C, 256, 256, 256]
+            # [B, 1, 2D-1, H, W] -> [B, 1, W, 2D-1, H] (rearrange to y-axis view)
+            vol_coronal = volume.permute(0, 2, 3, 1).unsqueeze(1)  # [B, 1, W, 2D-1, H]
+            seg_coronal = self.segmentation(vol_coronal)  # [B, C, W, 2D-1, H]
 
         return seg_axial, seg_sagittal, seg_coronal
 
@@ -223,24 +216,24 @@ class TrainingPipeline:
 
         Args:
             seg_axial, seg_sagittal, seg_coronal: Segmentations from different views
-            interpolated_volume: Interpolated volume [B, 256, H, W]
-            ground_truth_slices: Ground truth slices [B, 257, H, W] (optional)
-
+            interpolated_volume: Interpolated volume [B, 2D-1, H, W]
+            ground_truth_slices: Ground truth slices [B, 2D-1, H, W]
+        
         Returns:
             loss: Total loss
             loss_dict: Dictionary of individual loss components
         """
         # Remap sagittal and coronal to axial space for comparison
-        # seg_axial: [B, C, Z, Y, X]
-        # seg_sagittal: [B, C, X, Z, Y] (from permuted volume) -> need [B, C, Z, Y, X]
-        # seg_coronal: [B, C, Y, X, Z] (from permuted volume) -> need [B, C, Z, Y, X]
-        seg_sagittal_remapped = seg_sagittal.permute(0, 1, 3, 4, 2)  # [B, C, Z, Y, X]
-        seg_coronal_remapped = seg_coronal.permute(0, 1, 4, 2, 3)   # [B, C, Z, Y, X]
+        # seg_axial: [B, C, 2D-1, H, W]
+        # seg_sagittal: [B, C, H, W, 2D-1] (from permuted volume) -> need [B, C, 2D-1, H, W]
+        # seg_coronal: [B, C, W, 2D-1, H] (from permuted volume) -> need [B, C, 2D-1, H, W]
+        seg_sagittal_remapped = seg_sagittal.permute(0, 1, 3, 4, 2)  # [B, C, 2D-1, H, W]
+        seg_coronal_remapped = seg_coronal.permute(0, 1, 4, 2, 3)   # [B, C, 2D-1, H, W]
 
-        # Convert to [B, Z, Y, X, C] format for consistency loss (expects last dim as classes)
-        seg_axial_fmt = seg_axial.permute(0, 2, 3, 4, 1)  # [B, Z, Y, X, C]
-        seg_sag_fmt = seg_sagittal_remapped.permute(0, 2, 3, 4, 1)  # [B, Z, Y, X, C]
-        seg_cor_fmt = seg_coronal_remapped.permute(0, 2, 3, 4, 1)  # [B, Z, Y, X, C]
+        # Convert to [B, 2D-1, H, W, C] format for consistency loss (expects last dim as classes)
+        seg_axial_fmt = seg_axial.permute(0, 2, 3, 4, 1)  # [B, 2D-1, H, W, C]
+        seg_sag_fmt = seg_sagittal_remapped.permute(0, 2, 3, 4, 1)  # [B, 2D-1, H, W, C]
+        seg_cor_fmt = seg_coronal_remapped.permute(0, 2, 3, 4, 1)  # [B, 2D-1, H, W, C]
 
         is_first_batch = getattr(self, '_is_first_batch', False)
 
@@ -293,19 +286,15 @@ class TrainingPipeline:
         interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
         metrics = {'psnr': 0.0, 'ssim': 0.0}
         if ground_truth_slices is not None:
-            # Align ground truth to match interpolated volume size
-            # ground_truth_slices: [B, 257, H, W] -> take first 256 slices
-            ground_truth_aligned = ground_truth_slices[:, :256, :, :]
-
             # Set debug=True only for first batch of each epoch
             is_first_batch = getattr(self, '_is_first_batch', False)
             try:
                 interpolation_gt = self.interpolation_gt_loss(
-                    interpolated_volume, ground_truth_aligned, debug=is_first_batch
+                    interpolated_volume, ground_truth_slices, debug=is_first_batch
                 )
                 # Compute PSNR and SSIM metrics
                 metrics = self.interpolation_gt_loss.compute_metrics(
-                    interpolated_volume, ground_truth_aligned
+                    interpolated_volume, ground_truth_slices
                 )
             except Exception as e:
                 logger.warning(f"Failed to compute ground truth loss and metrics: {e}")
@@ -340,10 +329,10 @@ class TrainingPipeline:
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.num_epochs}')
         for batch_idx, batch in enumerate(pbar):
-            slices = batch['slices'].to(self.device)  # [B, N, H, W]
+            slices = batch['slices'].to(self.device)  # [B, D, H, W]
             ground_truth_slices = batch.get('ground_truth_slices', None)
             if ground_truth_slices is not None:
-                ground_truth_slices = ground_truth_slices.to(self.device)  # [B, 257, H, W]
+                ground_truth_slices = ground_truth_slices.to(self.device)  # [B, 2D-1, H, W]
 
             # Set debug flag for first batch
             self._is_first_batch = (batch_idx == 0)
@@ -391,12 +380,12 @@ class TrainingPipeline:
             # Visualize first batch of training
             if batch_idx == 0:
                 output_dir = Path(self.args.checkpoint_dir) / f'epoch_{epoch:03d}_train'
+                # Only visualize axial view to avoid dimension mismatch issues
+                # Axial segmentation is already in [C, 2D-1, H, W] format
                 self.visualize_segmentation(
                     slices[0],
                     interpolated_volume[0],
                     seg_axial[0],
-                    seg_sagittal[0],
-                    seg_coronal[0],
                     output_dir=output_dir,
                     epoch=epoch
                 )
@@ -451,27 +440,27 @@ class TrainingPipeline:
         Visualize segmentation results from multiple views
 
         Args:
-            original_slices: [N, H, W] - 原始输入切片
-            interpolated_volume: [D, H, W] - 插值后的体积
-            seg_axial: [C, D, H, W] - 轴向分割
-            seg_sagittal: [C, D, H, W] - 矢状分割
-            seg_coronal: [C, D, H, W] - 冠状分割
-            output_dir: 保存目录
-            epoch: 训练轮次
+            original_slices: [2D-1, H, W]
+            interpolated_volume: [2D-1, H, W]
+            seg_axial: [C, 2D-1, H, W]
+            seg_sagittal: [C, 2D-1, H, W]
+            seg_coronal: [C, 2D-1, H, W]
+            output_dir
+            epoch
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 转换为 numpy
-        interp_np = interpolated_volume.cpu().detach().numpy()  # [D, H, W]
-        seg_axial_np = seg_axial.cpu().detach().numpy()  # [C, D, H, W]
-        seg_sag_np = seg_sagittal.cpu().detach().numpy()  # [C, D, H, W]
-        seg_cor_np = seg_coronal.cpu().detach().numpy()  # [C, D, H, W]
-        orig_slices_np = original_slices.cpu().detach().numpy()  # [N, H, W]
+        interp_np = interpolated_volume.cpu().detach().numpy()  # [2D-1, H, W]
+        seg_axial_np = seg_axial.cpu().detach().numpy()  # [C, 2D-1, H, W]
+        seg_sag_np = seg_sagittal.cpu().detach().numpy()  # [C, 2D-1, H, W]
+        seg_cor_np = seg_coronal.cpu().detach().numpy()  # [C, 2D-1, H, W]
+        orig_slices_np = original_slices.cpu().detach().numpy()  # [2D-1, H, W]
 
-        D, H, W = interp_np.shape
+        N, H, W = interp_np.shape
 
-        # ===== 1. 保存原始切片 =====
+        # ===== 1. Save original slices =====
         orig_dir = output_dir / '1_original_slices'
         orig_dir.mkdir(exist_ok=True)
         for i, slice_data in enumerate(orig_slices_np):
@@ -479,7 +468,7 @@ class TrainingPipeline:
             img = Image.fromarray((slice_norm * 255).astype(np.uint8))
             img.save(orig_dir / f'slice_{i:03d}.png')
 
-        # ===== 2. 保存插值体积 =====
+        # ===== 2. Save interpolated volume =====
         interp_dir = output_dir / '2_interpolated_volume'
         interp_dir.mkdir(exist_ok=True)
         v_min, v_max = interp_np.min(), interp_np.max()
@@ -487,26 +476,26 @@ class TrainingPipeline:
             interp_norm = (interp_np - v_min) / (v_max - v_min) * 255
         else:
             interp_norm = interp_np * 255
-        for i in range(D):
+        for i in range(N):
             img = Image.fromarray(interp_norm[i].astype(np.uint8))
             img.save(interp_dir / f'frame_{i:03d}.png')
 
-        # ===== 3. 保存分割掩码 =====
+        # ===== 3. Save segmentation masks =====
         def save_segmentation_view(seg_logits, view_name):
-            """保存某个视图的分割结果"""
+            """Save segmentation masks for a given view"""
             view_dir = output_dir / f'3_masks_{view_name}'
             view_dir.mkdir(exist_ok=True)
 
-            # argmax 得到类别预测
-            mask = np.argmax(seg_logits, axis=0)  # [D, H, W]
+            # argmax to get discrete masks
+            mask = np.argmax(seg_logits, axis=0)  # [N, H, W]
 
-            # 保存每一帧
+            # Save each mask frame
             for frame_idx in range(mask.shape[0]):
                 mask_frame = mask[frame_idx].astype(np.uint8) * 127
                 img = Image.fromarray(mask_frame)
                 img.save(view_dir / f'mask_{frame_idx:03d}.png')
 
-            # 保存 3D numpy
+            # Save 3D numpy array
             np.save(view_dir / f'mask_3d.npy', mask)
             logger.info(f"Saved {view_name} masks to {view_dir}")
 
@@ -514,31 +503,31 @@ class TrainingPipeline:
         save_segmentation_view(seg_sag_np, 'sagittal')
         save_segmentation_view(seg_cor_np, 'coronal')
 
-        # ===== 4. 保存彩色叠加图 =====
+        # ===== 4. Save colored overlay images =====
         def save_overlay(seg_logits, interp_vol, view_name):
-            """保存分割掩码与原始图像的叠加"""
+            """Save overlay of segmentation masks and original images"""
             overlay_dir = output_dir / f'4_overlay_{view_name}'
             overlay_dir.mkdir(exist_ok=True)
 
-            # 获取前景概率
-            foreground_prob = np.exp(seg_logits[1]) / (np.exp(seg_logits[0]) + np.exp(seg_logits[1]))  # [D, H, W]
+            # Calculate foreground probability
+            foreground_prob = np.exp(seg_logits[1]) / (np.exp(seg_logits[0]) + np.exp(seg_logits[1]))  # [N, H, W]
 
-            # 逐帧保存叠加
+            # Save each overlay frame
             for frame_idx in range(interp_vol.shape[0]):
                 img_frame = (interp_vol[frame_idx] * 255).astype(np.uint8)
                 prob_frame = (foreground_prob[frame_idx] * 255).astype(np.uint8)
 
-                # 转换为 RGB
+                # Convert to RGB
                 img_rgb = np.stack([img_frame, img_frame, img_frame], axis=-1)
 
-                # 创建热力图
+                # Create heatmap
                 heatmap = np.stack([
                     np.zeros_like(prob_frame),  # R
                     (prob_frame * 0.7).astype(np.uint8),  # G
                     prob_frame  # B
                 ], axis=-1)
 
-                # 叠加
+                # Overlay
                 overlay = (0.5 * img_rgb + 0.5 * heatmap).astype(np.uint8)
                 img = Image.fromarray(overlay)
                 img.save(overlay_dir / f'overlay_{frame_idx:03d}.png')
@@ -549,7 +538,7 @@ class TrainingPipeline:
         save_overlay(seg_sag_np, interp_np, 'sagittal')
         save_overlay(seg_cor_np, interp_np, 'coronal')
 
-        # ===== 5. 保存统计信息 =====
+        # ===== 5. Save statistical information =====
         stats_file = output_dir / 'visualization_stats.txt'
         with open(stats_file, 'w') as f:
             f.write(f"Epoch: {epoch}\n")
@@ -656,57 +645,6 @@ class TrainingPipeline:
         logger.info("Training complete!")
 
 
-    def _load_full_volume_slices(self, file_path: str, num_output_slices: int = 257) -> np.ndarray:
-        """
-        Load all slices from a DICOM/npy file and return exactly num_output_slices
-        by linearly sampling across the full volume.
-
-        Args:
-            file_path: Path to DICOM or npy file
-            num_output_slices: Number of slices to extract (default 257 for 0-256)
-
-        Returns:
-            slices: [num_output_slices, H, W] normalized slices
-        """
-        file_path = Path(file_path)
-
-        # Load volume
-        if file_path.suffix == '.dcm':
-            dicom_data = pydicom.dcmread(str(file_path))
-            volume = dicom_data.pixel_array.astype(np.float32)
-        elif file_path.suffix == '.npy':
-            volume = np.load(file_path).astype(np.float32)
-        elif file_path.suffix == '.npz':
-            data = np.load(file_path)
-            volume = data['volume'].astype(np.float32)
-        else:
-            raise ValueError(f"Unsupported file format: {file_path.suffix}")
-
-        # Handle different dimensions
-        if len(volume.shape) == 2:
-            # Single slice - replicate
-            volume = np.stack([volume] * num_output_slices, axis=0)
-        elif len(volume.shape) == 4:
-            # Multi-frame - take first timepoint
-            volume = volume[0]
-
-        # Normalize
-        p1, p99 = np.percentile(volume, [1, 99])
-        volume = np.clip(volume, p1, p99)
-        vol_min = volume.min()
-        vol_max = volume.max()
-        if vol_max > vol_min:
-            volume = (volume - vol_min) / (vol_max - vol_min)
-        else:
-            volume = volume - vol_min
-
-        # Sample num_output_slices uniformly across the volume
-        num_available = volume.shape[0]
-        indices = np.linspace(0, num_available - 1, num_output_slices, dtype=int)
-        slices = volume[indices]
-
-        return slices
-
     def test(self):
         """Testing: load checkpoint, interpolate volume, visualize multi-view segmentations"""
         logger.info("Starting testing...")
@@ -743,24 +681,25 @@ class TrainingPipeline:
             file_path = batch['file_path'][0]
             logger.info(f"Processing test sample {batch_idx + 1}: {file_path}")
 
-            # Load full 257 slices
-            full_slices = self._load_full_volume_slices(file_path, num_output_slices=257)
+            # Load full slices
+            full_slices = load_and_normalize_volume(file_path)
 
-            # Save original slices
-            original_dir = output_dir / f'sample_{batch_idx:03d}/original_257'
-            original_dir.mkdir(parents=True, exist_ok=True)
-            for i, slice_data in enumerate(full_slices):
-                img = Image.fromarray((slice_data * 255).astype(np.uint8))
-                img.save(original_dir / f'slice_{i:03d}.png')
-            logger.info(f"  Saved {len(full_slices)} original slices")
-
-            # Extract every other slice (129 slices)
+            # Extract every other slice for interpolation input
             sampled_slices = full_slices[::2]
             sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
+            num_sampled = sampled_slices.shape[0]
 
-            # Use 256 slices from ground truth (matching interpolated output)
-            ground_truth_slices_256 = full_slices[:256]
-            ground_truth_tensor = torch.from_numpy(ground_truth_slices_256[np.newaxis, :, :, :]).float().to(self.device)
+            # Use num_sampled * 2 - 1 slices from ground truth (matching interpolated output)
+            ground_truth_slices = full_slices[:num_sampled * 2 - 1]
+            ground_truth_tensor = torch.from_numpy(ground_truth_slices[np.newaxis, :, :, :]).float().to(self.device)
+
+            # Save original slices
+            original_dir = output_dir / f'sample_{batch_idx:03d}/original_slices'
+            original_dir.mkdir(parents=True, exist_ok=True)
+            for i, slice_data in enumerate(ground_truth_slices):
+                img = Image.fromarray((slice_data * 255).astype(np.uint8))
+                img.save(original_dir / f'slice_{i:03d}.png')
+            logger.info(f"  Saved {len(ground_truth_slices)} original slices")
 
             # Interpolate
             with torch.no_grad():
@@ -768,7 +707,7 @@ class TrainingPipeline:
             interpolated_np = interpolated_volume[0].cpu().numpy()
 
             # Save interpolated slices
-            interpolated_dir = output_dir / f'sample_{batch_idx:03d}/interpolated_256'
+            interpolated_dir = output_dir / f'sample_{batch_idx:03d}/interpolated_slices'
             interpolated_dir.mkdir(parents=True, exist_ok=True)
             for i, slice_data in enumerate(interpolated_np):
                 slice_norm = np.clip(slice_data, 0, 1)
@@ -892,10 +831,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train 3D Medical Image Interpolation')
 
     # Data
-    parser.add_argument('--data_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/data',
+    parser.add_argument('--data_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/Colon_data',
                        help='Data directory')
-    parser.add_argument('--num_slices', type=int, default=129, help='Number of slices')
-    parser.add_argument('--img_size', type=int, default=256, help='Image size')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
@@ -926,9 +863,6 @@ def main():
     # ✓ Set random seed BEFORE any model/data initialization
     set_random_seed(args.seed)
 
-    # Convert img_size from int to tuple
-    args.img_size = (args.img_size, args.img_size)
-
     # Check CUDA availability
     if args.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA not available, using CPU")
@@ -937,9 +871,9 @@ def main():
     # Print config summary
     logger.info("-" * 80)
     logger.info("TRAINING CONFIGURATION")
-    logger.info(f"  Data: {args.data_dir} | {args.num_slices} slices | Size: {args.img_size}")
+    logger.info(f"  Data: {args.data_dir}")
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
-    logger.info(f"  Models: Interpolator=I3Net | Segmentation=MedSam (pretrained)")
+    logger.info(f"  Models: Interpolator=Saint | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Reproducibility: seed={args.seed}")
     logger.info("-" * 80)

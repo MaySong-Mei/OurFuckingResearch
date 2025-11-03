@@ -14,27 +14,72 @@ from scipy.ndimage import zoom
 logger = logging.getLogger(__name__)
 
 
+def load_and_normalize_volume(file_path: Path, downsample: bool = True) -> np.ndarray:
+    """
+    Load a volume from file, normalize it, and optionally downsample.
+
+    Args:
+        file_path: Path to DICOM, NPY, or NPZ file
+        downsample: If True, downsample H and W to half size to reduce memory
+
+    Returns:
+        Normalized volume as numpy array with shape [num_slices, H, W] or [num_slices, H//2, W//2]
+    """
+    file_path = Path(file_path)
+
+    # Load volume
+    if file_path.suffix == '.dcm':
+        dicom_data = pydicom.dcmread(str(file_path))
+        volume = dicom_data.pixel_array.astype(np.float32)
+    elif file_path.suffix == '.npy':
+        volume = np.load(file_path).astype(np.float32)
+    elif file_path.suffix == '.npz':
+        data = np.load(file_path)
+        volume = data['volume'].astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported file format: {file_path.suffix}")
+
+    # Handle different dimensions
+    if len(volume.shape) == 2:
+        # Single slice - replicate it
+        volume = np.stack([volume] * volume.shape[0], axis=0)
+    elif len(volume.shape) == 4:
+        # Multi-frame - take first timepoint
+        volume = volume[0]
+
+    # Normalize intensity to [0, 1]
+    p1, p99 = np.percentile(volume, [1, 99])
+    volume = np.clip(volume, p1, p99)
+    vol_min = volume.min()
+    vol_max = volume.max()
+    if vol_max > vol_min:
+        volume = (volume - vol_min) / (vol_max - vol_min)
+    else:
+        volume = volume - vol_min
+
+    # Downsample H and W to half size to reduce memory
+    if downsample:
+        # Use zoom with factors [1, 0.5, 0.5] to keep depth, halve H and W
+        volume = zoom(volume, (1, 0.5, 0.5), order=1)
+
+    return volume
+
+
 class MedicalVolumeDataset(Dataset):
     """Dataset for loading medical imaging volumes from DICOM files"""
 
     def __init__(
         self,
         data_dir: str,
-        split: str = 'train',
-        num_slices: int = 16,
-        img_size: Tuple[int, int] = (256, 256)
+        split: str = 'train'
     ):
         """
         Args:
             data_dir: Directory containing DICOM files or processed volumes
             split: 'train', 'val', or 'test'
-            num_slices: Number of slices to extract from each volume
-            img_size: Target size for each slice (H, W)
         """
         self.data_dir = Path(data_dir)
         self.split = split
-        self.num_slices = num_slices
-        self.img_size = img_size
 
         # Load file list
         self.files = self._load_file_list()
@@ -75,10 +120,7 @@ class MedicalVolumeDataset(Dataset):
         file_path = self.files[idx]
         volume = self._load_volume(file_path)
 
-        # Preprocess
-        volume = self._preprocess_volume(volume)
-
-        # Extract slices (sampled: 0, 2, 4, ..., 256) and ground truth (all slices)
+        # Extract slices and ground truth (all slices)
         slices, ground_truth_slices = self._extract_slices(volume)
 
         # Convert to tensor
@@ -86,8 +128,8 @@ class MedicalVolumeDataset(Dataset):
         ground_truth_tensor = torch.from_numpy(ground_truth_slices).float()
 
         return {
-            'slices': slices_tensor,  # [N, H, W] - sampled slices (129 slices)
-            'ground_truth_slices': ground_truth_tensor,  # [257, H, W] - all slices (0-256)
+            'slices': slices_tensor,  # [D, H, W]
+            'ground_truth_slices': ground_truth_tensor,  # [2D-1, H, W]
             'file_path': str(file_path),
             'volume_shape': volume.shape
         }
@@ -133,17 +175,6 @@ class MedicalVolumeDataset(Dataset):
             # Return dummy volume
             return np.zeros((self.num_slices, *self.img_size), dtype=np.float32)
 
-    def _preprocess_volume(self, volume: np.ndarray) -> np.ndarray:
-        """Preprocess volume: normalize intensity and resize"""
-        # Normalize intensity
-        volume = self._normalize_intensity(volume)
-
-        # Resize spatial dimensions if needed
-        if volume.shape[-2:] != self.img_size:
-            volume = self._resize_volume(volume, self.img_size)
-
-        return volume
-
     def _normalize_intensity(self, volume: np.ndarray) -> np.ndarray:
         """Normalize intensity values to [0, 1]"""
         # Clip outliers (optional)
@@ -161,61 +192,31 @@ class MedicalVolumeDataset(Dataset):
 
         return volume
 
-    def _resize_volume(self, volume: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
-        """Resize volume to target spatial dimensions"""
-        if len(volume.shape) == 3:
-            num_slices, H, W = volume.shape
-            zoom_factors = (1.0, target_size[0] / H, target_size[1] / W)
-        elif len(volume.shape) == 2:
-            H, W = volume.shape
-            zoom_factors = (target_size[0] / H, target_size[1] / W)
-        else:
-            raise ValueError(f"Unexpected volume shape: {volume.shape}")
-
-        resized = zoom(volume, zoom_factors, order=1)
-        return resized
-
     def _extract_slices(self, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Extract slices from volume:
-        1. Sampled slices: every 2nd slice (0, 2, 4, ..., 256) - 129 slices
-        2. Ground truth slices: all consecutive slices (0-256) - 257 slices
+        1. Sampled slices: every 2nd slice
+        2. Ground truth slices: all consecutive slices
+        3. Downsample H and W to half size
 
         Returns:
-            slices: [N, H, W] - sampled slices (129 slices with step=2)
-            ground_truth_slices: [257, H, W] - all slices (0-256)
+            slices: [D, H//2, W//2] - sampled slices, downsampled
+            ground_truth_slices: [2D-1, H//2, W//2] - all slices, downsampled
         """
-        if len(volume.shape) == 2:
-            # Single slice - replicate for both
-            slices = np.stack([volume] * self.num_slices, axis=0)
-            ground_truth_slices = np.stack([volume] * (self.num_slices * 2 - 1), axis=0)
-            return slices, ground_truth_slices
-
         num_slices_available = volume.shape[0]
 
-        if num_slices_available >= self.num_slices * 2:
-            # Sample with step of 2 (every other slice: 0, 2, 4, 6, ...)
-            indices = np.arange(0, num_slices_available, 2)
-            indices = indices[:self.num_slices]
-            slices = volume[indices]
+        # Sample with step of 2 (every other slice: 0, 2, 4, 6, ...)
+        indices = np.arange(0, num_slices_available, 2)
+        sampled_slices = volume[indices]
+        num_sampled_slices = sampled_slices.shape[0]
 
-            # Ground truth: all consecutive slices from 0 to min(256, num_slices_available-1)
-            # For 129 sampled slices with step=2, we need 257 consecutive slices
-            num_gt_slices = self.num_slices * 2 - 1  # 257 for 129 sampled slices
-            if num_slices_available >= num_gt_slices:
-                ground_truth_slices = volume[:num_gt_slices]
-            else:
-                # If not enough slices, pad with the last slice
-                ground_truth_slices = volume.copy()
-                pad_size = num_gt_slices - num_slices_available
-                ground_truth_slices = np.pad(
-                    ground_truth_slices,
-                    ((0, pad_size), (0, 0), (0, 0)),
-                    mode='edge'
-                )
-        else:
-            # Not enough slices
-            raise ValueError(f"Not enough slices in volume: {num_slices_available} available, "
-                             f"but {self.num_slices * 2} needed for step=2 sampling")
+        # Ground truth
+        num_gt_slices = 2 * num_sampled_slices - 1
+        ground_truth_slices = volume[:num_gt_slices]
 
-        return slices, ground_truth_slices
+        # Downsample H and W to half size to reduce memory
+        # Use zoom with factors [1, 0.5, 0.5] to keep depth, halve H and W
+        sampled_slices = zoom(sampled_slices, (1, 0.5, 0.5), order=1)
+        ground_truth_slices = zoom(ground_truth_slices, (1, 0.5, 0.5), order=1)
+
+        return sampled_slices, ground_truth_slices
