@@ -656,7 +656,7 @@ class TrainingPipeline:
         }
 
         # Process all test samples
-        pbar = tqdm(self.test_loader, desc='Testing')
+        pbar = tqdm(test_loader, desc='Testing')
         for batch_idx, batch in enumerate(pbar):
             file_path = batch['file_path'][0]
             logger.info(f"Processing test sample {batch_idx + 1}: {file_path}")
@@ -815,7 +815,7 @@ def main():
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=10, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=1, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
 
@@ -824,12 +824,12 @@ def main():
     parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--lambda_consistency', type=float, default=0.05, help='Consistency loss weight')
+    parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/Saint_checkpoints_colon',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/I3Net_checkpoints_colon_original',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
