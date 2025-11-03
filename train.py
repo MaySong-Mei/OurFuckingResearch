@@ -128,7 +128,8 @@ class TrainingPipeline:
         """Create data loader for train/val/test split"""
         dataset = MedicalVolumeDataset(
             data_dir=self.args.data_dir,
-            split=split
+            split=split,
+            max_slices=self.args.max_slices
         )
 
         return DataLoader(
@@ -144,15 +145,16 @@ class TrainingPipeline:
         Interpolate between slices to create denser volume using Saint
 
         Args:
-            slices: [B, D, H, W]
+            slices: [B, D, H, W] - sampled slices
 
         Returns:
-            interpolated: [B, 2D-1, H, W]
+            interpolated: [B, 2D-1, H, W] - densely interpolated slices
         """
         batch_size, num_slices, H, W = slices.shape
 
         # For 2x interpolation: N' = 2*N - 1
-        interpolated_slices = [slices[:, 0:1]]  # Keep dimension [B, 1, H, W]
+        # Pattern: [s0, m01, s1, m12, s2, ..., s(D-1)]
+        interpolated_slices = [slices[:, 0:1]]  # Start with first slice [B, 1, H, W]
 
         for i in range(num_slices - 1):
             # Get consecutive slice pairs
@@ -166,11 +168,12 @@ class TrainingPipeline:
                 # Saint returns [B, 1, H, W] - the interpolated middle frame
                 middle_frame = self.interpolator(saint_input)  # [B, 1, H, W]
 
+            # Append interpolated middle frame and next original frame
             interpolated_slices.append(middle_frame)
             interpolated_slices.append(frame1)
 
-        # Stack all slices: D -> 2D-1 slices
-        interpolated_slices.append(slices[:, -1:])  # Append last original slice
+        # Stack all slices: D original + (D-1) interpolated = 2D-1 total
+        # Note: frame1 is already appended in the last loop iteration, no need to append again
         interpolated = torch.cat(interpolated_slices, dim=1)  # [B, 2D-1, H, W]
 
         return interpolated
@@ -241,9 +244,6 @@ class TrainingPipeline:
         class_pred_axial = torch.argmax(seg_axial_fmt, dim=-1)
         logit_diff = seg_axial_fmt[..., 1] - seg_axial_fmt[..., 0]  # class1_logit - class0_logit
 
-        # Debug: Check segmentation output shape and values
-        logger.info(f"DEBUG Axial - seg_axial_fmt shape: {seg_axial_fmt.shape}, dtype: {seg_axial_fmt.dtype}")
-        logger.info(f"DEBUG Axial - class_pred_axial shape: {class_pred_axial.shape}, min: {class_pred_axial.min()}, max: {class_pred_axial.max()}")
         logger.info(f"Axial - Logits: max={seg_axial_fmt.max():.4f}, min={seg_axial_fmt.min():.4f}, mean={seg_axial_fmt.mean():.4f}")
         logger.info(f"Axial - Logit diff (class1-class0): mean={logit_diff.mean():.4f}, std={logit_diff.std():.4f}")
         logger.info(f"Axial - Prob class1: mean={prob_axial[..., 1].mean():.6f}, max={prob_axial[..., 1].max():.6f}")
@@ -255,8 +255,6 @@ class TrainingPipeline:
         prob_sagittal = F.softmax(seg_sag_fmt, dim=-1)
         class_pred_sagittal = torch.argmax(seg_sag_fmt, dim=-1)
         logit_diff_sag = seg_sag_fmt[..., 1] - seg_sag_fmt[..., 0]
-        logger.info(f"DEBUG Sagittal - seg_sag_fmt shape: {seg_sag_fmt.shape}, dtype: {seg_sag_fmt.dtype}")
-        logger.info(f"DEBUG Sagittal - class_pred_sagittal shape: {class_pred_sagittal.shape}, min: {class_pred_sagittal.min()}, max: {class_pred_sagittal.max()}")
         logger.info(f"Sagittal - Logit diff (class1-class0): mean={logit_diff_sag.mean():.4f}, std={logit_diff_sag.std():.4f}")
         logger.info(f"Sagittal - Prob class1: mean={prob_sagittal[..., 1].mean():.6f}, max={prob_sagittal[..., 1].max():.6f}")
         class_pred_sag_flat = class_pred_sagittal.flatten().int()
@@ -266,8 +264,6 @@ class TrainingPipeline:
         prob_coronal = F.softmax(seg_cor_fmt, dim=-1)
         class_pred_coronal = torch.argmax(seg_cor_fmt, dim=-1)
         logit_diff_cor = seg_cor_fmt[..., 1] - seg_cor_fmt[..., 0]
-        logger.info(f"DEBUG Coronal - seg_cor_fmt shape: {seg_cor_fmt.shape}, dtype: {seg_cor_fmt.dtype}")
-        logger.info(f"DEBUG Coronal - class_pred_coronal shape: {class_pred_coronal.shape}, min: {class_pred_coronal.min()}, max: {class_pred_coronal.max()}")
         logger.info(f"Coronal - Logit diff (class1-class0): mean={logit_diff_cor.mean():.4f}, std={logit_diff_cor.std():.4f}")
         logger.info(f"Coronal - Prob class1: mean={prob_coronal[..., 1].mean():.6f}, max={prob_coronal[..., 1].max():.6f}")
         class_pred_cor_flat = class_pred_coronal.flatten().int()
@@ -277,7 +273,8 @@ class TrainingPipeline:
         # Multi-view consistency losses (self-supervised signal)
         consistency_sag = self.consistency_loss(seg_axial_fmt, seg_sag_fmt, debug=is_first_batch)
         consistency_cor = self.consistency_loss(seg_axial_fmt, seg_cor_fmt, debug=is_first_batch)
-        consistency_total = (consistency_sag + consistency_cor) / 2
+        consistency_sag_cor = self.consistency_loss(seg_sag_fmt, seg_cor_fmt, debug=is_first_batch)
+        consistency_total = (consistency_sag + consistency_cor + consistency_sag_cor) / 3
 
         # Smoothness regularization
         smoothness = self.smoothness_loss(interpolated_volume)
@@ -329,6 +326,7 @@ class TrainingPipeline:
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.num_epochs}')
         for batch_idx, batch in enumerate(pbar):
+            
             slices = batch['slices'].to(self.device)  # [B, D, H, W]
             ground_truth_slices = batch.get('ground_truth_slices', None)
             if ground_truth_slices is not None:
@@ -364,6 +362,8 @@ class TrainingPipeline:
                 )
 
             self.optimizer.step()
+            
+            torch.cuda.empty_cache()
 
             # Logging
             epoch_losses.append(loss_dict)
@@ -380,12 +380,18 @@ class TrainingPipeline:
             # Visualize first batch of training
             if batch_idx == 0:
                 output_dir = Path(self.args.checkpoint_dir) / f'epoch_{epoch:03d}_train'
-                # Only visualize axial view to avoid dimension mismatch issues
+                
                 # Axial segmentation is already in [C, 2D-1, H, W] format
+                # Remap sagittal and coronal to axial format for visualization
+                seg_sagittal_remapped = seg_sagittal.permute(0, 1, 3, 4, 2)  # [B, C, 2D-1, H, W]
+                seg_coronal_remapped = seg_coronal.permute(0, 1, 4, 2, 3)   # [B, C, 2D-1, H, W]
+
                 self.visualize_segmentation(
                     slices[0],
                     interpolated_volume[0],
                     seg_axial[0],
+                    seg_sagittal_remapped[0],
+                    seg_coronal_remapped[0],
                     output_dir=output_dir,
                     epoch=epoch
                 )
@@ -833,6 +839,7 @@ def main():
     # Data
     parser.add_argument('--data_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/Colon_data',
                        help='Data directory')
+    parser.add_argument('--max_slices', type=int, default=32, help='Maximum sampled slices per volume (to avoid OOM)')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
@@ -845,12 +852,12 @@ def main():
     parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--lambda_consistency', type=float, default=0.01, help='Consistency loss weight')
-    parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
-    parser.add_argument('--lambda_interpolation_gt', type=float, default=1.0, help='Interpolation ground truth loss weight')
+    parser.add_argument('--lambda_consistency', type=float, default=1, help='Consistency loss weight')
+    parser.add_argument('--lambda_smoothness', type=float, default=0.01, help='Smoothness loss weight')
+    parser.add_argument('--lambda_interpolation_gt', type=float, default=0.1, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/Saint_checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/Saint_checkpoints_colon',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -871,7 +878,7 @@ def main():
     # Print config summary
     logger.info("-" * 80)
     logger.info("TRAINING CONFIGURATION")
-    logger.info(f"  Data: {args.data_dir}")
+    logger.info(f"  Data: {args.data_dir} (max_slices={args.max_slices})")
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
     logger.info(f"  Models: Interpolator=Saint | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")

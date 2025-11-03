@@ -40,7 +40,8 @@ class SmoothnessLoss(nn.Module):
         super().__init__()
 
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
-        """Compute first-order smoothness loss"""
+        """Compute first-order smoothness loss with volume normalized to [0, 1]"""
+        # Calculate differences between adjacent slices
         diff = volume[:, 1:] - volume[:, :-1]
         return torch.abs(diff).mean()
 

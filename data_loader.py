@@ -57,11 +57,6 @@ def load_and_normalize_volume(file_path: Path, downsample: bool = True) -> np.nd
     else:
         volume = volume - vol_min
 
-    # Downsample H and W to half size to reduce memory
-    if downsample:
-        # Use zoom with factors [1, 0.5, 0.5] to keep depth, halve H and W
-        volume = zoom(volume, (1, 0.5, 0.5), order=1)
-
     return volume
 
 
@@ -71,20 +66,25 @@ class MedicalVolumeDataset(Dataset):
     def __init__(
         self,
         data_dir: str,
-        split: str = 'train'
+        split: str = 'train',
+        max_slices: int = 128
     ):
         """
         Args:
             data_dir: Directory containing DICOM files or processed volumes
             split: 'train', 'val', or 'test'
+            max_slices: Maximum number of sampled slices to keep (to avoid OOM).
+                       If volume has more sampled slices, discard the extras.
         """
         self.data_dir = Path(data_dir)
         self.split = split
+        self.max_slices = max_slices
 
         # Load file list
         self.files = self._load_file_list()
 
         logger.info(f"Loaded {len(self.files)} files for {split} split")
+        logger.info(f"Max slices per volume: {self.max_slices}")
 
     def _load_file_list(self) -> List[Path]:
         """Load list of DICOM files or volume files"""
@@ -197,12 +197,13 @@ class MedicalVolumeDataset(Dataset):
         Extract slices from volume:
         1. Sampled slices: every 2nd slice
         2. Ground truth slices: all consecutive slices
-        3. Downsample H and W to half size
+        3. Limit sampled slices to max_slices to avoid OOM
 
         Returns:
-            slices: [D, H//2, W//2] - sampled slices, downsampled
-            ground_truth_slices: [2D-1, H//2, W//2] - all slices, downsampled
+            slices: [D, H, W] - sampled slices
+            ground_truth_slices: [2D-1, H, W] - ground truth slices
         """
+        volume = volume.transpose(2, 0, 1) # [H, W, D] -> [D, H, W]
         num_slices_available = volume.shape[0]
 
         # Sample with step of 2 (every other slice: 0, 2, 4, 6, ...)
@@ -210,13 +211,14 @@ class MedicalVolumeDataset(Dataset):
         sampled_slices = volume[indices]
         num_sampled_slices = sampled_slices.shape[0]
 
-        # Ground truth
-        num_gt_slices = 2 * num_sampled_slices - 1
-        ground_truth_slices = volume[:num_gt_slices]
+        # Limit to max_slices to avoid OOM during interpolation
+        if num_sampled_slices > self.max_slices:
+            sampled_slices = sampled_slices[:self.max_slices]
+            num_sampled_slices = self.max_slices
 
-        # Downsample H and W to half size to reduce memory
-        # Use zoom with factors [1, 0.5, 0.5] to keep depth, halve H and W
-        sampled_slices = zoom(sampled_slices, (1, 0.5, 0.5), order=1)
-        ground_truth_slices = zoom(ground_truth_slices, (1, 0.5, 0.5), order=1)
+        # Ground truth: use the limited sampled slices to compute GT size
+        num_gt_slices = 2 * num_sampled_slices - 1
+        # But GT should come from the original volume (first num_gt_slices from original)
+        ground_truth_slices = volume[:num_gt_slices]
 
         return sampled_slices, ground_truth_slices
