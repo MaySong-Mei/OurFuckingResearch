@@ -13,53 +13,6 @@ from scipy.ndimage import zoom
 
 logger = logging.getLogger(__name__)
 
-
-def load_and_normalize_volume(file_path: Path, downsample: bool = True) -> np.ndarray:
-    """
-    Load a volume from file, normalize it, and optionally downsample.
-
-    Args:
-        file_path: Path to DICOM, NPY, or NPZ file
-        downsample: If True, downsample H and W to half size to reduce memory
-
-    Returns:
-        Normalized volume as numpy array with shape [num_slices, H, W] or [num_slices, H//2, W//2]
-    """
-    file_path = Path(file_path)
-
-    # Load volume
-    if file_path.suffix == '.dcm':
-        dicom_data = pydicom.dcmread(str(file_path))
-        volume = dicom_data.pixel_array.astype(np.float32)
-    elif file_path.suffix == '.npy':
-        volume = np.load(file_path).astype(np.float32)
-    elif file_path.suffix == '.npz':
-        data = np.load(file_path)
-        volume = data['volume'].astype(np.float32)
-    else:
-        raise ValueError(f"Unsupported file format: {file_path.suffix}")
-
-    # Handle different dimensions
-    if len(volume.shape) == 2:
-        # Single slice - replicate it
-        volume = np.stack([volume] * volume.shape[0], axis=0)
-    elif len(volume.shape) == 4:
-        # Multi-frame - take first timepoint
-        volume = volume[0]
-
-    # Normalize intensity to [0, 1]
-    p1, p99 = np.percentile(volume, [1, 99])
-    volume = np.clip(volume, p1, p99)
-    vol_min = volume.min()
-    vol_max = volume.max()
-    if vol_max > vol_min:
-        volume = (volume - vol_min) / (vol_max - vol_min)
-    else:
-        volume = volume - vol_min
-
-    return volume
-
-
 class MedicalVolumeDataset(Dataset):
     """Dataset for loading medical imaging volumes from DICOM files"""
 
@@ -177,7 +130,7 @@ class MedicalVolumeDataset(Dataset):
 
     def _normalize_intensity(self, volume: np.ndarray) -> np.ndarray:
         """Normalize intensity values to [0, 1]"""
-        # Clip outliers (optional)
+        # Clip outliers
         p1, p99 = np.percentile(volume, [1, 99])
         volume = np.clip(volume, p1, p99)
 
@@ -220,5 +173,9 @@ class MedicalVolumeDataset(Dataset):
         num_gt_slices = 2 * num_sampled_slices - 1
         # But GT should come from the original volume (first num_gt_slices from original)
         ground_truth_slices = volume[:num_gt_slices]
+
+        # Normalize intensities
+        sampled_slices = self._normalize_intensity(sampled_slices)
+        ground_truth_slices = self._normalize_intensity(ground_truth_slices)
 
         return sampled_slices, ground_truth_slices

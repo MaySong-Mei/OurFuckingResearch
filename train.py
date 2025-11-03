@@ -28,7 +28,7 @@ if _current_dir in sys.path:
 sys.path.insert(0, _current_dir)
 
 # Now import local modules
-from data_loader import MedicalVolumeDataset, load_and_normalize_volume
+from data_loader import MedicalVolumeDataset
 from models.saint_adapter import SaintInterpolator
 from models.medsam_infer import MedSAM2Segmenter
 
@@ -280,23 +280,19 @@ class TrainingPipeline:
         smoothness = self.smoothness_loss(interpolated_volume)
 
         # Ground truth interpolation loss and metrics
-        interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
-        metrics = {'psnr': 0.0, 'ssim': 0.0}
         if ground_truth_slices is not None:
             # Set debug=True only for first batch of each epoch
             is_first_batch = getattr(self, '_is_first_batch', False)
-            try:
-                interpolation_gt = self.interpolation_gt_loss(
-                    interpolated_volume, ground_truth_slices, debug=is_first_batch
-                )
-                # Compute PSNR and SSIM metrics
-                metrics = self.interpolation_gt_loss.compute_metrics(
-                    interpolated_volume, ground_truth_slices
-                )
-            except Exception as e:
-                logger.warning(f"Failed to compute ground truth loss and metrics: {e}")
-                interpolation_gt = torch.tensor(0.0, device=interpolated_volume.device)
-                metrics = {'psnr': 0.0, 'ssim': 0.0}
+            interpolation_gt = self.interpolation_gt_loss(
+                interpolated_volume, ground_truth_slices, debug=is_first_batch
+            )
+            # Compute PSNR and SSIM metrics
+            metrics = self.interpolation_gt_loss.compute_metrics(
+                interpolated_volume, ground_truth_slices
+            )
+
+        else:
+            print("No ground truth slices provided for interpolation loss.")
 
         # Total weighted loss
         total_loss = (
@@ -369,11 +365,7 @@ class TrainingPipeline:
             epoch_losses.append(loss_dict)
 
             # Print detailed loss breakdown with metrics
-            loss_str = f"L:{loss_dict['total']:.4f} | C:{loss_dict['consistency']:.4f} | S:{loss_dict['smoothness']:.4f} | GT:{loss_dict['interpolation_gt']:.4f}"
-
-            # Add PSNR/SSIM if available
-            if loss_dict['psnr'] > 0:
-                loss_str += f" | PSNR:{loss_dict['psnr']:.2f}dB | SSIM:{loss_dict['ssim']:.4f}"
+            loss_str = f"L:{loss_dict['total']:.4f} | C:{loss_dict['consistency']:.4f} | S:{loss_dict['smoothness']:.4f} | GT:{loss_dict['interpolation_gt']:.4f} | PSNR:{loss_dict['psnr']:.2f}dB | SSIM:{loss_dict['ssim']:.4f}"
 
             pbar.set_postfix({'status': loss_str}, refresh=True)
 
@@ -683,20 +675,19 @@ class TrainingPipeline:
         }
 
         # Process all test samples
-        for batch_idx, batch in enumerate(test_loader):
+        pbar = tqdm(self.test_loader, desc='Testing')
+        for batch_idx, batch in enumerate(pbar):
             file_path = batch['file_path'][0]
             logger.info(f"Processing test sample {batch_idx + 1}: {file_path}")
 
-            # Load full slices
-            full_slices = load_and_normalize_volume(file_path)
+            sampled_slices = batch['slices'].numpy()  # [D, H, W]
 
             # Extract every other slice for interpolation input
-            sampled_slices = full_slices[::2]
             sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
             num_sampled = sampled_slices.shape[0]
 
             # Use num_sampled * 2 - 1 slices from ground truth (matching interpolated output)
-            ground_truth_slices = full_slices[:num_sampled * 2 - 1]
+            ground_truth_slices = batch.get('ground_truth_slices', None)
             ground_truth_tensor = torch.from_numpy(ground_truth_slices[np.newaxis, :, :, :]).float().to(self.device)
 
             # Save original slices
@@ -852,9 +843,9 @@ def main():
     parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--lambda_consistency', type=float, default=1, help='Consistency loss weight')
-    parser.add_argument('--lambda_smoothness', type=float, default=0.01, help='Smoothness loss weight')
-    parser.add_argument('--lambda_interpolation_gt', type=float, default=0.1, help='Interpolation ground truth loss weight')
+    parser.add_argument('--lambda_consistency', type=float, default=0.05, help='Consistency loss weight')
+    parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
+    parser.add_argument('--lambda_interpolation_gt', type=float, default=1, help='Interpolation ground truth loss weight')
 
     # Checkpoint & Device
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/Saint_checkpoints_colon',
