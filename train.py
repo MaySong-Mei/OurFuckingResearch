@@ -68,6 +68,7 @@ class TrainingPipeline:
     def __init__(self, args):
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_consistency_weighting = bool(args.use_consistency_weighting)
 
         # Initialize models
         self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
@@ -202,7 +203,7 @@ class TrainingPipeline:
             seg_axial, seg_sagittal, seg_coronal: Segmentations from different views
             interpolated_volume: Interpolated volume [B, 2D-1, H, W]
             ground_truth_slices: Ground truth slices [B, 2D-1, H, W]
-        
+
         Returns:
             loss: Total loss
             loss_dict: Dictionary of individual loss components
@@ -222,6 +223,9 @@ class TrainingPipeline:
         is_first_batch = getattr(self, '_is_first_batch', False)
 
         prob_axial = F.softmax(seg_axial_fmt, dim=-1)
+        prob_sagittal = F.softmax(seg_sag_fmt, dim=-1)
+        prob_coronal = F.softmax(seg_cor_fmt, dim=-1)
+
         class_pred_axial = torch.argmax(seg_axial_fmt, dim=-1)
         logit_diff = seg_axial_fmt[..., 1] - seg_axial_fmt[..., 0]  # class1_logit - class0_logit
 
@@ -233,7 +237,7 @@ class TrainingPipeline:
         class_pred_flat = class_pred_axial.flatten().int()
         class_dist = torch.bincount(class_pred_flat)
         logger.info(f"Axial - Class distribution: {class_dist.tolist()} (ratio: {(class_dist.float() / class_pred_axial.numel()).tolist()})")
-        prob_sagittal = F.softmax(seg_sag_fmt, dim=-1)
+
         class_pred_sagittal = torch.argmax(seg_sag_fmt, dim=-1)
         logit_diff_sag = seg_sag_fmt[..., 1] - seg_sag_fmt[..., 0]
         logger.info(f"Sagittal - Logit diff (class1-class0): mean={logit_diff_sag.mean():.4f}, std={logit_diff_sag.std():.4f}")
@@ -242,7 +246,6 @@ class TrainingPipeline:
         class_dist_sag = torch.bincount(class_pred_sag_flat)
         logger.info(f"Sagittal - Class distribution: {class_dist_sag.tolist()} (ratio: {(class_dist_sag.float() / class_pred_sagittal.numel()).tolist()})")
 
-        prob_coronal = F.softmax(seg_cor_fmt, dim=-1)
         class_pred_coronal = torch.argmax(seg_cor_fmt, dim=-1)
         logit_diff_cor = seg_cor_fmt[..., 1] - seg_cor_fmt[..., 0]
         logger.info(f"Coronal - Logit diff (class1-class0): mean={logit_diff_cor.mean():.4f}, std={logit_diff_cor.std():.4f}")
@@ -250,6 +253,20 @@ class TrainingPipeline:
         class_pred_cor_flat = class_pred_coronal.flatten().int()
         class_dist_cor = torch.bincount(class_pred_cor_flat)
         logger.info(f"Coronal - Class distribution: {class_dist_cor.tolist()} (ratio: {(class_dist_cor.float() / class_pred_coronal.numel()).tolist()})")
+
+        # Generate consistency weights from multi-view segmentations if enabled
+        if self.use_consistency_weighting:
+            consistency_weights = self.interpolation_gt_loss.consistency_weighting(
+                prob_axial, prob_sagittal, prob_coronal
+            )  # [B, 2D-1, H, W]
+
+            if is_first_batch:
+                avg_weight = consistency_weights.mean().item()
+                logger.info(f"Consistency weights - mean={avg_weight:.4f}, min={consistency_weights.min():.4f}, max={consistency_weights.max():.4f}")
+        else:
+            consistency_weights = None
+            if is_first_batch:
+                logger.info("Consistency weighting disabled (baseline reconstruction loss)")
 
         # Multi-view consistency losses (self-supervised signal)
         consistency_sag = self.consistency_loss(seg_axial_fmt, seg_sag_fmt, debug=is_first_batch)
@@ -260,18 +277,15 @@ class TrainingPipeline:
         # Smoothness regularization
         smoothness = self.smoothness_loss(interpolated_volume)
 
-        # Ground truth interpolation loss and metrics
+        # Ground truth interpolation loss and metrics with optional consistency weighting
         if ground_truth_slices is not None:
-            # Set debug=True only for first batch of each epoch
-            is_first_batch = getattr(self, '_is_first_batch', False)
             interpolation_gt = self.interpolation_gt_loss(
-                interpolated_volume, ground_truth_slices, debug=is_first_batch
+                interpolated_volume, ground_truth_slices, weights=consistency_weights, debug=is_first_batch
             )
             # Compute PSNR and SSIM metrics
             metrics = self.interpolation_gt_loss.compute_metrics(
                 interpolated_volume, ground_truth_slices
             )
-
         else:
             print("No ground truth slices provided for interpolation loss.")
 
@@ -827,6 +841,7 @@ def main():
     parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1, help='Interpolation ground truth loss weight')
+    parser.add_argument('--use_consistency_weighting', type=int, default=1, help='Use multi-view consistency weighting (0=no, 1=yes)')
 
     # Checkpoint & Device
     parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/I3Net_checkpoints_colon_original',
@@ -852,6 +867,8 @@ def main():
     logger.info("TRAINING CONFIGURATION")
     logger.info(f"  Data: {args.data_dir} (max_slices={args.max_slices})")
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
+    logger.info(f"  Loss Weights: consistency={args.lambda_consistency} smoothness={args.lambda_smoothness} interp_gt={args.lambda_interpolation_gt}")
+    logger.info(f"  Consistency Weighting: {'ENABLED' if args.use_consistency_weighting else 'DISABLED'}")
     logger.info(f"  Models: Interpolator=I3Net | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Reproducibility: seed={args.seed}")

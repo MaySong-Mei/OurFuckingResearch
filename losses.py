@@ -46,12 +46,54 @@ class SmoothnessLoss(nn.Module):
         return torch.abs(diff).mean()
 
 
+class SegmentationConsistencyWeighting(nn.Module):
+    """Generate pixel-wise weights based on multi-view segmentation consistency"""
+
+    def forward(self, prob_axial: torch.Tensor, prob_sagittal: torch.Tensor,
+                prob_coronal: torch.Tensor) -> torch.Tensor:
+        """
+        Generate consistency weights from three views.
+        Higher weight for inconsistent regions (where views disagree).
+
+        Args:
+            prob_axial: [B, N, H, W, C] - axial view probabilities
+            prob_sagittal: [B, N, H, W, C] - sagittal view probabilities (remapped)
+            prob_coronal: [B, N, H, W, C] - coronal view probabilities (remapped)
+
+        Returns:
+            weights: [B, N, H, W] - pixel-wise weights (normalized to [0.5, 1.0])
+        """
+        # Compute class predictions for each view
+        class_axial = torch.argmax(prob_axial, dim=-1)  # [B, N, H, W]
+        class_sag = torch.argmax(prob_sagittal, dim=-1)  # [B, N, H, W]
+        class_cor = torch.argmax(prob_coronal, dim=-1)  # [B, N, H, W]
+
+        # Measure disagreement: count how many views differ from majority vote
+        majority_vote = torch.mode(
+            torch.stack([class_axial, class_sag, class_cor], dim=-1),
+            dim=-1
+        ).values  # [B, N, H, W]
+
+        disagreement = (
+            (class_axial != majority_vote).float() +
+            (class_sag != majority_vote).float() +
+            (class_cor != majority_vote).float()
+        ) / 3.0  # [B, N, H, W], range [0, 1]
+
+        # Convert disagreement to weights: higher disagreement -> higher weight
+        # Scale to [0.5, 1.0] to keep confident regions non-zero
+        weights = 0.5 + 0.5 * disagreement
+
+        return weights
+
+
 class InterpolationGroundTruthLoss(nn.Module):
     """L1 loss with optional SSIM for interpolation quality"""
 
     def __init__(self, loss_type: str = 'l1', use_ssim: bool = False):
         super().__init__()
         self.use_ssim = use_ssim
+        self.consistency_weighting = SegmentationConsistencyWeighting()
 
     def _compute_ssim(self, x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
         """Compute SSIM loss"""
@@ -123,12 +165,30 @@ class InterpolationGroundTruthLoss(nn.Module):
         return {'psnr': psnr, 'ssim': ssim}
 
     def forward(self, interpolated_volume: torch.Tensor,
-                ground_truth_slices: torch.Tensor, debug: bool = False) -> torch.Tensor:
-        """Compute interpolation loss with L1 and optional SSIM"""
+                ground_truth_slices: torch.Tensor, weights: torch.Tensor = None,
+                debug: bool = False) -> torch.Tensor:
+        """
+        Compute interpolation loss with L1 and optional SSIM.
+
+        Args:
+            interpolated_volume: [B, N, H, W]
+            ground_truth_slices: [B, N, H, W]
+            weights: [B, N, H, W] - pixel-wise weights from consistency
+        """
         interpolated_intermediate = interpolated_volume[:, 1::2, :, :]
         ground_truth_intermediate = ground_truth_slices[:, 1::2, :, :]
 
-        pixel_loss = F.l1_loss(interpolated_intermediate, ground_truth_intermediate)
+        # Compute per-pixel L1 loss
+        pixel_loss = torch.abs(interpolated_intermediate - ground_truth_intermediate)
+
+        # Apply consistency weights if provided
+        if weights is not None:
+            # Extract intermediate frame weights
+            weight_intermediate = weights[:, 1::2, :, :]
+            # Expand weights to match pixel_loss spatial dims
+            pixel_loss = pixel_loss * weight_intermediate
+
+        pixel_loss = pixel_loss.mean()
 
         if self.use_ssim:
             ssim_loss = self._compute_ssim(interpolated_intermediate, ground_truth_intermediate)
