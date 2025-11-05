@@ -624,6 +624,125 @@ class TrainingPipeline:
         msg += f"{'='*80}"
         logger.info(msg)
 
+    def load_checkpoint(self, checkpoint_path: str = 'best.pth'):
+        """Load checkpoint for interpolator"""
+        ckpt_path = Path(self.args.checkpoint_dir) / checkpoint_path
+
+        if not ckpt_path.exists():
+            logger.warning(f"Checkpoint not found at {ckpt_path}")
+            return False
+
+        try:
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.interpolator.load_state_dict(checkpoint['interpolator_state_dict'])
+            logger.info(f"Loaded checkpoint from {ckpt_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return False
+            
+
+    @torch.no_grad()
+    def test(self):
+        """Test on test set, compute PSNR and SSIM, save results"""
+        # Load best checkpoint
+        self.load_checkpoint('best.pth')
+        self.interpolator.eval()
+
+        # Create test loader
+        test_loader = self._create_data_loader('test')
+
+        if len(test_loader) == 0:
+            logger.warning("No test data available")
+            return
+
+        logger.info(f"Testing on {len(test_loader.dataset)} samples")
+
+        # Create output directory
+        test_output_dir = Path(self.args.checkpoint_dir) / 'test_results'
+        test_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create subdirectories
+        slices_dir = test_output_dir / 'slices'
+        slices_dir.mkdir(exist_ok=True)
+
+        all_psnr = []
+        all_ssim = []
+
+        log_content = "Test Results\n"
+        log_content += "=" * 80 + "\n"
+        log_content += f"Total samples: {len(test_loader.dataset)}\n\n"
+
+        # Test loop
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc='Testing')):
+            slices = batch['slices'].to(self.device)
+            ground_truth_slices = batch.get('ground_truth_slices', None)
+
+            if ground_truth_slices is None:
+                logger.warning(f"Batch {batch_idx} has no ground truth, skipping")
+                continue
+
+            ground_truth_slices = ground_truth_slices.to(self.device)
+
+            # Interpolate
+            interpolated_volume = self.interpolate_volume(slices)
+
+            # Compute metrics
+            metrics = self.interpolation_gt_loss.compute_metrics(
+                interpolated_volume, ground_truth_slices
+            )
+
+            psnr = metrics['psnr']
+            ssim = metrics['ssim']
+
+            all_psnr.append(psnr)
+            all_ssim.append(ssim)
+
+            # Save slices as PNG images
+            batch_output_dir = slices_dir / f'batch_{batch_idx:04d}'
+            gt_dir = batch_output_dir / 'ground_truth_slices'
+            interp_dir = batch_output_dir / 'interpolated_slices'
+            gt_dir.mkdir(parents=True, exist_ok=True)
+            interp_dir.mkdir(parents=True, exist_ok=True)
+
+            gt_np = ground_truth_slices[0].cpu().numpy()
+            interp_np = interpolated_volume[0].cpu().numpy()
+
+            # Save ground truth slices
+            for i, slice_data in enumerate(gt_np):
+                slice_norm = np.clip(slice_data, 0, 1)
+                img = Image.fromarray((slice_norm * 255).astype(np.uint8))
+                img.save(gt_dir / f'slice_{i:03d}.png')
+
+            # Save interpolated slices
+            for i, slice_data in enumerate(interp_np):
+                slice_norm = np.clip(slice_data, 0, 1)
+                img = Image.fromarray((slice_norm * 255).astype(np.uint8))
+                img.save(interp_dir / f'slice_{i:03d}.png')
+
+            # Log batch results
+            log_content += f"Batch {batch_idx:4d}: PSNR={psnr:7.2f} dB, SSIM={ssim:7.4f}\n"
+
+        # Compute averages
+        if all_psnr:
+            avg_psnr = np.mean(all_psnr)
+            avg_ssim = np.mean(all_ssim)
+
+            log_content += "\n" + "=" * 80 + "\n"
+            log_content += f"Average PSNR: {avg_psnr:.2f} dB\n"
+            log_content += f"Average SSIM: {avg_ssim:.4f}\n"
+            log_content += "=" * 80 + "\n"
+
+            logger.info(f"Average PSNR: {avg_psnr:.2f} dB")
+            logger.info(f"Average SSIM: {avg_ssim:.4f}")
+
+        # Save log file
+        log_path = test_output_dir / 'test_results.log'
+        with open(log_path, 'w') as f:
+            f.write(log_content)
+
+        logger.info(f"Test results saved to {test_output_dir}")
+
     def train(self):
         """Main training loop"""
         logger.info(f"Starting training on {self.device}")
@@ -647,185 +766,6 @@ class TrainingPipeline:
         logger.info("Training complete!")
 
 
-    def test(self):
-        """Testing: load checkpoint, interpolate volume, visualize multi-view segmentations"""
-        logger.info("Starting testing...")
-
-        test_loader = self._create_data_loader('test')
-        if len(test_loader.dataset) == 0:
-            logger.warning("No test data found, skipping test")
-            return
-
-        output_dir = Path(self.args.checkpoint_dir) / 'test_results'
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Load best checkpoint
-        checkpoint_path = Path(self.args.checkpoint_dir) / 'best.pth'
-        if checkpoint_path.exists():
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            self.interpolator.load_state_dict(checkpoint['interpolator_state_dict'])
-            logger.info(f"Loaded checkpoint from {checkpoint_path}")
-        else:
-            logger.warning("Checkpoint not found, using current model state")
-
-        self.interpolator.eval()
-
-        # Track metrics across all test samples
-        test_metrics = {
-            'sample_id': [],
-            'file_path': [],
-            'psnr': [],
-            'ssim': []
-        }
-
-        # Process all test samples
-        pbar = tqdm(test_loader, desc='Testing')
-        for batch_idx, batch in enumerate(pbar):
-            file_path = batch['file_path'][0]
-            logger.info(f"Processing test sample {batch_idx + 1}: {file_path}")
-
-            sampled_slices = batch['slices'].numpy()  # [D, H, W]
-
-            # Extract every other slice for interpolation input
-            sampled_tensor = torch.from_numpy(sampled_slices[np.newaxis, :, :, :]).float().to(self.device)
-            num_sampled = sampled_slices.shape[0]
-
-            # Use num_sampled * 2 - 1 slices from ground truth (matching interpolated output)
-            ground_truth_slices = batch.get('ground_truth_slices', None)
-            ground_truth_slices = ground_truth_slices.numpy()
-            ground_truth_tensor = torch.from_numpy(ground_truth_slices[np.newaxis, :, :, :]).float().to(self.device)
-
-            # Save original slices
-            original_dir = output_dir / f'sample_{batch_idx:03d}/original_slices'
-            original_dir.mkdir(parents=True, exist_ok=True)
-            for i, slice_data in enumerate(ground_truth_slices):
-                img = Image.fromarray((slice_data * 255).astype(np.uint8))
-                img.save(original_dir / f'slice_{i:03d}.png')
-            logger.info(f"  Saved {len(ground_truth_slices)} original slices")
-
-            # Interpolate
-            with torch.no_grad():
-                interpolated_volume = self.interpolate_volume(sampled_tensor)
-            interpolated_np = interpolated_volume[0].cpu().numpy()
-
-            # Save interpolated slices
-            interpolated_dir = output_dir / f'sample_{batch_idx:03d}/interpolated_slices'
-            interpolated_dir.mkdir(parents=True, exist_ok=True)
-            for i, slice_data in enumerate(interpolated_np):
-                slice_norm = np.clip(slice_data, 0, 1)
-                img = Image.fromarray((slice_norm * 255).astype(np.uint8))
-                img.save(interpolated_dir / f'slice_{i:03d}.png')
-            logger.info(f"  Saved {len(interpolated_np)} interpolated slices")
-
-            # Compute metrics for this sample
-            if ground_truth_tensor.shape[1] == interpolated_volume.shape[1]:
-                try:
-                    metrics = self.interpolation_gt_loss.compute_metrics(
-                        interpolated_volume, ground_truth_tensor
-                    )
-                    psnr_val = metrics['psnr']
-                    ssim_val = metrics['ssim']
-
-                    # Record metrics
-                    test_metrics['sample_id'].append(batch_idx)
-                    test_metrics['file_path'].append(Path(file_path).name)
-                    test_metrics['psnr'].append(psnr_val)
-                    test_metrics['ssim'].append(ssim_val)
-
-                    logger.info(f"  Sample {batch_idx + 1}: PSNR={psnr_val:.2f} dB, SSIM={ssim_val:.4f}")
-                except Exception as e:
-                    logger.error(f"  Failed to compute metrics: {e}")
-            else:
-                logger.warning(f"  Shape mismatch: GT {ground_truth_tensor.shape[1]} vs Interp {interpolated_volume.shape[1]}")
-
-        # Save metrics to CSV
-        if test_metrics['psnr']:
-            import csv
-
-            metrics_file = output_dir / 'test_metrics.csv'
-            with open(metrics_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Sample ID', 'File Path', 'PSNR (dB)', 'SSIM'])
-                for i, sample_id in enumerate(test_metrics['sample_id']):
-                    writer.writerow([
-                        sample_id,
-                        test_metrics['file_path'][i],
-                        f"{test_metrics['psnr'][i]:.2f}",
-                        f"{test_metrics['ssim'][i]:.4f}"
-                    ])
-            logger.info(f"Saved per-sample metrics to {metrics_file}")
-
-            # Compute statistics
-            psnr_values = np.array(test_metrics['psnr'])
-            ssim_values = np.array(test_metrics['ssim'])
-
-            avg_psnr = np.mean(psnr_values)
-            std_psnr = np.std(psnr_values)
-            min_psnr = np.min(psnr_values)
-            max_psnr = np.max(psnr_values)
-
-            avg_ssim = np.mean(ssim_values)
-            std_ssim = np.std(ssim_values)
-            min_ssim = np.min(ssim_values)
-            max_ssim = np.max(ssim_values)
-
-            # Log detailed test results
-            logger.info("\n" + "="*80)
-            logger.info("TEST RESULTS - PER-SAMPLE METRICS")
-            logger.info("="*80)
-            for i, sample_id in enumerate(test_metrics['sample_id']):
-                logger.info(f"Sample {sample_id}: {test_metrics['file_path'][i]}")
-                logger.info(f"  PSNR: {test_metrics['psnr'][i]:.2f} dB")
-                logger.info(f"  SSIM: {test_metrics['ssim'][i]:.4f}")
-
-            logger.info("\n" + "="*80)
-            logger.info("TEST RESULTS - STATISTICS")
-            logger.info("="*80)
-            logger.info(f"PSNR Statistics (dB):")
-            logger.info(f"  Mean:   {avg_psnr:.2f}")
-            logger.info(f"  Std:    {std_psnr:.2f}")
-            logger.info(f"  Min:    {min_psnr:.2f}")
-            logger.info(f"  Max:    {max_psnr:.2f}")
-            logger.info(f"\nSSIM Statistics:")
-            logger.info(f"  Mean:   {avg_ssim:.4f}")
-            logger.info(f"  Std:    {std_ssim:.4f}")
-            logger.info(f"  Min:    {min_ssim:.4f}")
-            logger.info(f"  Max:    {max_ssim:.4f}")
-            logger.info(f"\nTotal samples: {len(test_metrics['psnr'])}")
-            logger.info("="*80)
-
-            # Save summary to text file
-            summary_file = output_dir / 'test_summary.txt'
-            with open(summary_file, 'w') as f:
-                f.write("="*80 + "\n")
-                f.write("TEST RESULTS - PER-SAMPLE METRICS\n")
-                f.write("="*80 + "\n")
-                for i, sample_id in enumerate(test_metrics['sample_id']):
-                    f.write(f"Sample {sample_id}: {test_metrics['file_path'][i]}\n")
-                    f.write(f"  PSNR: {test_metrics['psnr'][i]:.2f} dB\n")
-                    f.write(f"  SSIM: {test_metrics['ssim'][i]:.4f}\n")
-
-                f.write("\n" + "="*80 + "\n")
-                f.write("TEST RESULTS - STATISTICS\n")
-                f.write("="*80 + "\n")
-                f.write(f"PSNR Statistics (dB):\n")
-                f.write(f"  Mean:   {avg_psnr:.2f}\n")
-                f.write(f"  Std:    {std_psnr:.2f}\n")
-                f.write(f"  Min:    {min_psnr:.2f}\n")
-                f.write(f"  Max:    {max_psnr:.2f}\n")
-                f.write(f"\nSSIM Statistics:\n")
-                f.write(f"  Mean:   {avg_ssim:.4f}\n")
-                f.write(f"  Std:    {std_ssim:.4f}\n")
-                f.write(f"  Min:    {min_ssim:.4f}\n")
-                f.write(f"  Max:    {max_ssim:.4f}\n")
-                f.write(f"\nTotal samples: {len(test_metrics['psnr'])}\n")
-                f.write("="*80 + "\n")
-            logger.info(f"Saved test summary to {summary_file}")
-
-        logger.info(f"Test complete. Results saved to {output_dir}")
-        logger.info("Testing finished!")
-
-
 def main():
     """Entry point"""
     import argparse
@@ -838,8 +778,8 @@ def main():
     parser.add_argument('--max_slices', type=int, default=32, help='Maximum sampled slices per volume (to avoid OOM)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=5, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=20, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
 
@@ -864,7 +804,7 @@ def main():
                        help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/I3Net_colon_original',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/test',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -898,8 +838,8 @@ def main():
 
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
-    # pipeline.train()
-    pipeline.test()
+    pipeline.train()
+    # pipeline.test()
 
 
 if __name__ == '__main__':
