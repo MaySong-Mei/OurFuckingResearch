@@ -47,13 +47,42 @@ class SmoothnessLoss(nn.Module):
 
 
 class SegmentationConsistencyWeighting(nn.Module):
-    """Generate pixel-wise weights based on multi-view segmentation consistency"""
+    """
+    Generate pixel-wise weights based on multi-view segmentation consistency.
+
+    Design Objective:
+    - Higher weights for inconsistent regions (where views disagree)
+    - Tolerance for small errors: small probability differences don't trigger high weights
+    - Smooth and differentiable mapping using sigmoid
+    - Adjustable sensitivity via hyperparameters
+    """
+
+    def __init__(self, w_min: float = 0.5, w_max: float = 2.0,
+                 tau: float = 0.15, kappa: float = 0.4):
+        """
+        Initialize consistency weighting module.
+
+        Args:
+            w_min (float): Weight for consistent regions (default: 0.5)
+            w_max (float): Weight for inconsistent regions (default: 2.0)
+            tau (float): Tolerance threshold for variance (default: 0.15)
+            kappa (float): Smoothness coefficient controlling growth speed (default: 0.4)
+        """
+        super().__init__()
+        self.w_min = w_min
+        self.w_max = w_max
+        self.tau = tau
+        self.kappa = kappa
 
     def forward(self, prob_axial: torch.Tensor, prob_sagittal: torch.Tensor,
                 prob_coronal: torch.Tensor) -> torch.Tensor:
         """
-        Generate consistency weights from three views.
-        Higher weight for inconsistent regions (where views disagree).
+        Generate consistency weights from three views using variance-based approach.
+
+        Algorithm:
+        1. Compute per-class variance across three views
+        2. Sum variances to get total inconsistency metric u(i)
+        3. Map u(i) to weights using sigmoid with tolerance threshold
 
         Args:
             prob_axial: [B, N, H, W, C] - axial view probabilities
@@ -61,28 +90,30 @@ class SegmentationConsistencyWeighting(nn.Module):
             prob_coronal: [B, N, H, W, C] - coronal view probabilities (remapped)
 
         Returns:
-            weights: [B, N, H, W] - pixel-wise weights (normalized to [0.5, 1.0])
+            weights: [B, N, H, W] - pixel-wise weights
         """
-        # Compute class predictions for each view
-        class_axial = torch.argmax(prob_axial, dim=-1)  # [B, N, H, W]
-        class_sag = torch.argmax(prob_sagittal, dim=-1)  # [B, N, H, W]
-        class_cor = torch.argmax(prob_coronal, dim=-1)  # [B, N, H, W]
+        # Get number of classes
+        C = prob_axial.shape[-1]
 
-        # Measure disagreement: count how many views differ from majority vote
-        majority_vote = torch.mode(
-            torch.stack([class_axial, class_sag, class_cor], dim=-1),
+        # Stack probabilities for each class: [B, N, H, W, C, 3]
+        probs_stacked = torch.stack(
+            [prob_axial, prob_sagittal, prob_coronal],
             dim=-1
-        ).values  # [B, N, H, W]
+        )  # [B, N, H, W, C, 3]
 
-        disagreement = (
-            (class_axial != majority_vote).float() +
-            (class_sag != majority_vote).float() +
-            (class_cor != majority_vote).float()
-        ) / 3.0  # [B, N, H, W], range [0, 1]
+        # Compute variance across views for each class
+        # var(c) for each voxel and class
+        class_variances = torch.var(probs_stacked, dim=-1)  # [B, N, H, W, C]
 
-        # Convert disagreement to weights: higher disagreement -> higher weight
-        # Scale to [0.5, 1.0] to keep confident regions non-zero
-        weights = 0.5 + 0.5 * disagreement
+        # Sum variances across classes to get total inconsistency metric
+        # u(i) = sum_c var_c(i)
+        inconsistency_metric = class_variances.sum(dim=-1)  # [B, N, H, W]
+
+        # Map inconsistency metric to weights using sigmoid with tolerance
+        # w(i) = w_min + (w_max - w_min) * sigmoid((u(i) - tau) / kappa)
+        sigmoid_input = (inconsistency_metric - self.tau) / self.kappa
+        sigmoid_output = torch.sigmoid(sigmoid_input)
+        weights = self.w_min + (self.w_max - self.w_min) * sigmoid_output
 
         return weights
 
@@ -90,10 +121,15 @@ class SegmentationConsistencyWeighting(nn.Module):
 class InterpolationGroundTruthLoss(nn.Module):
     """L1 loss with optional SSIM for interpolation quality"""
 
-    def __init__(self, loss_type: str = 'l1', use_ssim: bool = False):
+    def __init__(self, loss_type: str = 'l1', use_ssim: bool = False,
+                 weight_params: dict = None):
         super().__init__()
         self.use_ssim = use_ssim
-        self.consistency_weighting = SegmentationConsistencyWeighting()
+
+        # Initialize consistency weighting with custom parameters
+        if weight_params is None:
+            weight_params = {}
+        self.consistency_weighting = SegmentationConsistencyWeighting(**weight_params)
 
     def _compute_ssim(self, x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
         """Compute SSIM loss"""

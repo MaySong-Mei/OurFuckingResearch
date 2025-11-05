@@ -99,7 +99,16 @@ class TrainingPipeline:
         # Loss functions
         self.consistency_loss = ConsistencyLoss(loss_type='dice')
         self.smoothness_loss = SmoothnessLoss()
-        self.interpolation_gt_loss = InterpolationGroundTruthLoss(loss_type='l1', use_ssim=True)
+        self.interpolation_gt_loss = InterpolationGroundTruthLoss(
+            loss_type='l1',
+            use_ssim=True,
+            weight_params={
+                'w_min': self.args.weight_w_min,
+                'w_max': self.args.weight_w_max,
+                'tau': self.args.weight_tau,
+                'kappa': self.args.weight_kappa
+            }
+        )
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -683,6 +692,7 @@ class TrainingPipeline:
 
             # Use num_sampled * 2 - 1 slices from ground truth (matching interpolated output)
             ground_truth_slices = batch.get('ground_truth_slices', None)
+            ground_truth_slices = ground_truth_slices.numpy()
             ground_truth_tensor = torch.from_numpy(ground_truth_slices[np.newaxis, :, :, :]).float().to(self.device)
 
             # Save original slices
@@ -828,8 +838,8 @@ def main():
     parser.add_argument('--max_slices', type=int, default=32, help='Maximum sampled slices per volume (to avoid OOM)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=1, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=5, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=20, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
 
@@ -841,10 +851,20 @@ def main():
     parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1, help='Interpolation ground truth loss weight')
-    parser.add_argument('--use_consistency_weighting', type=int, default=1, help='Use multi-view consistency weighting (0=no, 1=yes)')
+    parser.add_argument('--use_consistency_weighting', type=int, default=0, help='Use multi-view consistency weighting (0=no, 1=yes)')
+
+    # Consistency weighting parameters (variance-based with sigmoid mapping)
+    parser.add_argument('--weight_w_min', type=float, default=0.5,
+                       help='Minimum weight for consistent regions (default: 0.5)')
+    parser.add_argument('--weight_w_max', type=float, default=2.0,
+                       help='Maximum weight for inconsistent regions (default: 2.0)')
+    parser.add_argument('--weight_tau', type=float, default=0.15,
+                       help='Tolerance threshold for variance (default: 0.15)')
+    parser.add_argument('--weight_kappa', type=float, default=0.4,
+                       help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/I3Net_checkpoints_colon_original',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/I3Net_colon_original',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -869,6 +889,8 @@ def main():
     logger.info(f"  Training: batch={args.batch_size} epochs={args.num_epochs} lr={args.learning_rate}")
     logger.info(f"  Loss Weights: consistency={args.lambda_consistency} smoothness={args.lambda_smoothness} interp_gt={args.lambda_interpolation_gt}")
     logger.info(f"  Consistency Weighting: {'ENABLED' if args.use_consistency_weighting else 'DISABLED'}")
+    if args.use_consistency_weighting:
+        logger.info(f"    - Weight params: w_min={args.weight_w_min} w_max={args.weight_w_max} tau={args.weight_tau} kappa={args.weight_kappa}")
     logger.info(f"  Models: Interpolator=I3Net | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Reproducibility: seed={args.seed}")
@@ -876,7 +898,7 @@ def main():
 
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
-    pipeline.train()
+    # pipeline.train()
     pipeline.test()
 
 
