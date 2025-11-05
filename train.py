@@ -30,6 +30,7 @@ sys.path.insert(0, _current_dir)
 # Now import local modules
 from data_loader import MedicalVolumeDataset
 from models.i3net_adapter import I3NetInterpolator
+from models.rife_adapter import RIFEInterpolator
 from models.medsam_infer import MedSAM2Segmenter
 
 from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
@@ -70,8 +71,13 @@ class TrainingPipeline:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.use_consistency_weighting = bool(args.use_consistency_weighting)
 
-        # Initialize models
-        self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
+        # Initialize interpolator model
+        if args.interpolator_model.lower() == 'rife':
+            self.interpolator = RIFEInterpolator(upscale=2, device=str(self.device))
+            logger.info("Using RIFE (IFNet) for interpolation")
+        else:
+            self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
+            logger.info("Using I3Net for interpolation")
 
         # Initialize MedSAM2 for 3D segmentation
         logger.info("Using MedSAM2 for 3D segmentation")
@@ -782,6 +788,8 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
+    parser.add_argument('--interpolator_model', type=str, default='i3net',
+                       choices=['i3net', 'rife'], help='Interpolator model (i3net or rife)')
 
     # Optimizer & Loss
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
@@ -804,7 +812,7 @@ def main():
                        help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/test',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/rife_colon_original',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -831,7 +839,7 @@ def main():
     logger.info(f"  Consistency Weighting: {'ENABLED' if args.use_consistency_weighting else 'DISABLED'}")
     if args.use_consistency_weighting:
         logger.info(f"    - Weight params: w_min={args.weight_w_min} w_max={args.weight_w_max} tau={args.weight_tau} kappa={args.weight_kappa}")
-    logger.info(f"  Models: Interpolator=I3Net | Segmentation=MedSam (pretrained)")
+    logger.info(f"  Models: Interpolator={args.interpolator_model.upper()} | Segmentation=MedSam (pretrained)")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Reproducibility: seed={args.seed}")
     logger.info("-" * 80)
