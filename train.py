@@ -28,9 +28,10 @@ if _current_dir in sys.path:
 sys.path.insert(0, _current_dir)
 
 # Now import local modules
-from data_loader import MedicalVolumeDataset
+from data_loader import MedicalVolumeDataset, TVSRNDataset
 from models.i3net_adapter import I3NetInterpolator
 from models.rife_adapter import RIFEInterpolator
+from models.tvsrn_adapter import TVSRNInterpolator
 from models.medsam_infer import MedSAM2Segmenter
 
 from losses import ConsistencyLoss, SmoothnessLoss, InterpolationGroundTruthLoss
@@ -75,6 +76,9 @@ class TrainingPipeline:
         if args.interpolator_model.lower() == 'rife':
             self.interpolator = RIFEInterpolator(upscale=2, device=str(self.device))
             logger.info("Using RIFE (IFNet) for interpolation")
+        elif args.interpolator_model.lower() == 'tvsrn':
+            self.interpolator = TVSRNInterpolator(device=str(self.device))
+            logger.info("Using TVSRN for interpolation")
         else:
             self.interpolator = I3NetInterpolator(upscale=2, device=str(self.device))
             logger.info("Using I3Net for interpolation")
@@ -142,11 +146,18 @@ class TrainingPipeline:
 
     def _create_data_loader(self, split: str) -> DataLoader:
         """Create data loader for train/val/test split"""
-        dataset = MedicalVolumeDataset(
-            data_dir=self.args.data_dir,
-            split=split,
-            max_slices=self.args.max_slices
-        )
+        if self.args.interpolator_model.lower() == 'tvsrn':
+            dataset = TVSRNDataset(
+                data_dir=self.args.data_dir,
+                split=split,
+                max_slices=self.args.max_slices
+            )
+        else:
+            dataset = MedicalVolumeDataset(
+                data_dir=self.args.data_dir,
+                split=split,
+                max_slices=self.args.max_slices
+            )
 
         return DataLoader(
             dataset,
@@ -332,7 +343,7 @@ class TrainingPipeline:
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.num_epochs}')
         for batch_idx, batch in enumerate(pbar):
-            
+
             slices = batch['slices'].to(self.device)  # [B, D, H, W]
             ground_truth_slices = batch.get('ground_truth_slices', None)
             if ground_truth_slices is not None:
@@ -785,11 +796,11 @@ def main():
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
     parser.add_argument('--interpolator_model', type=str, default='i3net',
-                       choices=['i3net', 'rife'], help='Interpolator model (i3net or rife)')
+                       choices=['i3net', 'rife', 'tvsrn'], help='Interpolator model (i3net, rife, or tvsrn)')
 
     # Optimizer & Loss
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
@@ -799,7 +810,7 @@ def main():
     parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1, help='Interpolation ground truth loss weight')
-    parser.add_argument('--use_consistency_weighting', type=int, default=0, help='Use multi-view consistency weighting (0=no, 1=yes)')
+    parser.add_argument('--use_consistency_weighting', type=int, default=1, help='Use multi-view consistency weighting (0=no, 1=yes)')
 
     # Consistency weighting parameters (variance-based with sigmoid mapping)
     parser.add_argument('--weight_w_min', type=float, default=0.5,
@@ -812,7 +823,7 @@ def main():
                        help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/rife_colon_original',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/tvsrn_colon_100',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -847,7 +858,7 @@ def main():
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
     pipeline.train()
-    # pipeline.test()
+    pipeline.test()
 
 
 if __name__ == '__main__':
