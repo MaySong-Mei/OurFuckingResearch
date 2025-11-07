@@ -641,8 +641,8 @@ class TrainingPipeline:
         msg += f"{'='*80}"
         logger.info(msg)
 
-    def load_checkpoint(self, checkpoint_path: str = 'best.pth'):
-        """Load checkpoint for interpolator"""
+    def load_checkpoint(self, checkpoint_path: str = 'best.pth', load_optimizer: bool = False):
+        """Load checkpoint - optionally restoring optimizer/scheduler state for continued training"""
         ckpt_path = Path(self.args.checkpoint_dir) / checkpoint_path
 
         if not ckpt_path.exists():
@@ -652,8 +652,18 @@ class TrainingPipeline:
         try:
             checkpoint = torch.load(ckpt_path, map_location=self.device)
             self.interpolator.load_state_dict(checkpoint['interpolator_state_dict'])
-            logger.info(f"Loaded checkpoint from {ckpt_path}")
-            return True
+
+            if load_optimizer:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                self.global_step = checkpoint.get('global_step', 0)
+                self.best_val_loss = checkpoint.get('val_loss', float('inf'))
+                start_epoch = checkpoint.get('epoch', 0)
+                logger.info(f"Loaded checkpoint from {ckpt_path} | Resume from epoch {start_epoch}, global_step={self.global_step}")
+                return start_epoch
+            else:
+                logger.info(f"Loaded checkpoint from {ckpt_path} (model weights only)")
+                return True
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             return False
@@ -760,12 +770,23 @@ class TrainingPipeline:
 
         logger.info(f"Test results saved to {test_output_dir}")
 
-    def train(self):
-        """Main training loop"""
+    def train(self, resume: bool = True):
+        """Main training loop with optional resume from checkpoint"""
         logger.info(f"Starting training on {self.device}")
         logger.info(f"Dataset: {len(self.train_loader.dataset)} train, {len(self.val_loader.dataset)} val")
 
-        for epoch in range(1, self.args.num_epochs + 1):
+        start_epoch = 1
+
+        # Try to load latest checkpoint if resume=True
+        if resume:
+            latest_ckpt = Path(self.args.checkpoint_dir) / 'latest.pth'
+            if latest_ckpt.exists():
+                result = self.load_checkpoint('latest.pth', load_optimizer=True)
+                if isinstance(result, int) and result > 0:
+                    start_epoch = result + 1
+                    logger.info(f"Resuming training from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, self.args.num_epochs + 1):
             train_loss = self.train_epoch(epoch)
             self._log_losses(train_loss, "TRAIN", epoch)
 
@@ -823,13 +844,14 @@ def main():
                        help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/tvsrn_colon_100',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/tvsrn_colon',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
 
     # Reproducibility
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--resume', type=int, default=1, help='Resume from latest checkpoint if exists (0=no, 1=yes)')
 
     args = parser.parse_args()
 
@@ -857,7 +879,7 @@ def main():
 
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
-    pipeline.train()
+    pipeline.train(resume=bool(args.resume))
     pipeline.test()
 
 
