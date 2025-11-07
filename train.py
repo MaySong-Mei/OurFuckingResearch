@@ -831,7 +831,7 @@ def main():
     parser.add_argument('--lambda_consistency', type=float, default=0, help='Consistency loss weight')
     parser.add_argument('--lambda_smoothness', type=float, default=0.1, help='Smoothness loss weight')
     parser.add_argument('--lambda_interpolation_gt', type=float, default=1, help='Interpolation ground truth loss weight')
-    parser.add_argument('--use_consistency_weighting', type=int, default=1, help='Use multi-view consistency weighting (0=no, 1=yes)')
+    parser.add_argument('--use_consistency_weighting', type=int, default=0, help='Use multi-view consistency weighting (0=no, 1=yes)')
 
     # Consistency weighting parameters (variance-based with sigmoid mapping)
     parser.add_argument('--weight_w_min', type=float, default=0.5,
@@ -844,7 +844,7 @@ def main():
                        help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/tvsrn_colon',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/tvsrn_colon_original',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
