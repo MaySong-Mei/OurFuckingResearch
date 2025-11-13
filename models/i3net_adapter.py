@@ -19,7 +19,7 @@ class I3NetInterpolator(nn.Module):
         device: device to use
     """
 
-    def __init__(self, upscale=2, device='cuda'):
+    def __init__(self, upscale=2, device='cuda', checkpoint_path=None):
         super(I3NetInterpolator, self).__init__()
         self.device = device
         self.upscale = upscale
@@ -41,7 +41,18 @@ class I3NetInterpolator(nn.Module):
         self.args.upscale = upscale
 
         self.model = I3Net(self.args).to(device)
-        # self.target_size = 256
+
+        # Load checkpoint if provided
+        if checkpoint_path is not None:
+            import os
+            if os.path.exists(checkpoint_path):
+                state_dict = torch.load(checkpoint_path, map_location=device)
+                self.model.load_state_dict(state_dict, strict=False)
+                print(f"✓ Loaded I3Net checkpoint from {checkpoint_path}")
+            else:
+                print(f"⚠ Warning: I3Net checkpoint not found at {checkpoint_path}")
+        else:
+            print("⚠ Warning: No I3Net checkpoint provided, using randomly initialized model")
 
     def forward(self, x):
         """

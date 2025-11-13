@@ -57,16 +57,16 @@ class SegmentationConsistencyWeighting(nn.Module):
     - Adjustable sensitivity via hyperparameters
     """
 
-    def __init__(self, w_min: float = 0.5, w_max: float = 2.0,
-                 tau: float = 0.15, kappa: float = 0.4):
+    def __init__(self, w_min: float = 0.5, w_max: float = 3.0,
+                 tau: float = 0.02, kappa: float = 0.1):
         """
         Initialize consistency weighting module.
 
         Args:
             w_min (float): Weight for consistent regions (default: 0.5)
-            w_max (float): Weight for inconsistent regions (default: 2.0)
-            tau (float): Tolerance threshold for variance (default: 0.15)
-            kappa (float): Smoothness coefficient controlling growth speed (default: 0.4)
+            w_max (float): Weight for inconsistent regions (default: 3.0)
+            tau (float): Tolerance threshold for variance (default: 0.02)
+            kappa (float): Smoothness coefficient controlling growth speed (default: 0.1)
         """
         super().__init__()
         self.w_min = w_min

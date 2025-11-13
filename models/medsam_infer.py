@@ -58,7 +58,11 @@ class MedSAM2Segmenter(nn.Module):
         logger.info(f"Loaded MedSAM2 from {ckpt_path}")
 
     def _get_full_image_box(self, H: int, W: int) -> np.ndarray:
-        """Get full image bounding box as automatic prompt."""
+        """Get full image bounding box as automatic prompt.
+
+        For initial mask prompt on middle slice, use the entire image
+        as the bounding box since we don't have prior segmentation information.
+        """
         # [x_min, y_min, x_max, y_max]
         return np.array([0, 0, W - 1, H - 1], dtype=np.float32)
 
@@ -120,23 +124,53 @@ class MedSAM2Segmenter(nn.Module):
             # Use resized dimensions for init_state and box
             inference_state = self.predictor.init_state(img_tensor, 512, 512)
 
-            # Get automatic prompt: full image bounding box
-            box = self._get_full_image_box(512, 512)
+            # Step 1: Initial segmentation with full image bbox to locate object
+            logger.info("Step 1: Initial segmentation with full image bbox")
+            full_box = self._get_full_image_box(512, 512)
 
-            # Add initial mask prompt using bounding box
-            _, _, out_mask_logits = self.predictor.add_new_points_or_box(
+            _, _, middle_mask_logits = self.predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=D // 2,  # Start from middle frame
                 obj_id=1,
-                box=box,
+                box=full_box,
             )
+
+            # Step 2: Extract refined bbox from the middle frame's segmentation
+            logger.info("Step 2: Extracting refined bbox from middle frame segmentation")
+            middle_mask_binary = (middle_mask_logits[0, 0] > 0).cpu().numpy().astype(np.uint8)  # [512, 512]
+
+            # Find foreground pixels
+            foreground_indices = np.where(middle_mask_binary > 0)
+
+            if len(foreground_indices[0]) > 0:
+                # Get bounds of foreground region
+                y_min, y_max = foreground_indices[0].min(), foreground_indices[0].max()
+                x_min, x_max = foreground_indices[1].min(), foreground_indices[1].max()
+
+                # Add some padding (e.g., 5% of size) to avoid cutting off edges
+                h_pad = int(0.05 * (y_max - y_min))
+                w_pad = int(0.05 * (x_max - x_min))
+                y_min = max(0, y_min - h_pad)
+                y_max = min(511, y_max + h_pad)
+                x_min = max(0, x_min - w_pad)
+                x_max = min(511, x_max + w_pad)
+
+                box = np.array([x_min, y_min, x_max, y_max], dtype=np.float32)
+                logger.info(f"Refined bbox: {box}")
+            else:
+                logger.warning("No foreground found in initial segmentation, using full image bbox")
+                box = full_box
+
+            # Reuse the middle_mask_logits from step 1 (no need to re-segment)
 
             # Propagate segmentation through entire volume
             # Store at original size (resize back from 512x512)
-            out_mask_resized = F.interpolate(out_mask_logits, size=(orig_H, orig_W), mode='bilinear', align_corners=False)
+            middle_mask_resized = F.interpolate(middle_mask_logits, size=(orig_H, orig_W), mode='bilinear', align_corners=False)
             mask_logits_all = torch.zeros(D, 1, orig_H, orig_W, device=self.device)
-            mask_logits_all[D // 2] = out_mask_resized[0]  # Store initial mask
+            mask_logits_all[D // 2] = middle_mask_resized[0]  # Store initial mask
 
+            # Step 2a: Propagate forward (D//2 → D-1) using refined box
+            logger.info("Step 2a: Propagating forward using refined bbox")
             # Propagate forward
             for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
                 inference_state, start_frame_idx=D // 2, reverse=False
@@ -144,11 +178,12 @@ class MedSAM2Segmenter(nn.Module):
                 out_mask_resized = F.interpolate(out_mask_logits, size=(orig_H, orig_W), mode='bilinear', align_corners=False)
                 mask_logits_all[out_frame_idx] = out_mask_resized[0]
 
-            # Reset and propagate backward
+            # Step 3: Reset and propagate backward using refined box
+            logger.info("Step 3: Propagating backward using refined bbox")
             self.predictor.reset_state(inference_state)
             inference_state = self.predictor.init_state(img_tensor, 512, 512)
 
-            # Re-add initial mask
+            # Re-add initial mask with refined box
             self.predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=D // 2,

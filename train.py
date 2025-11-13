@@ -673,7 +673,7 @@ class TrainingPipeline:
     def test(self):
         """Test on test set, compute PSNR and SSIM, save results"""
         # Load best checkpoint
-        self.load_checkpoint('best.pth')
+        self.load_checkpoint('epoch_50.pth')
         self.interpolator.eval()
 
         # Create test loader
@@ -817,7 +817,7 @@ def main():
 
     # Training
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=1000, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
     parser.add_argument('--interpolator_model', type=str, default='i3net',
@@ -844,7 +844,7 @@ def main():
                        help='Smoothness coefficient controlling growth speed (default: 0.4)')
 
     # Checkpoint & Device
-    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/tvsrn_colon_original',
+    parser.add_argument('--checkpoint_dir', type=str, default='/gpfs/radev/scratch/zhuoran_yang/sl3348/med_data/weight_checkpoints/i3net_colon',
                        help='Checkpoint directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=0, help='Data loading workers (0=main process)')
@@ -879,7 +879,7 @@ def main():
 
     # Create and run pipeline
     pipeline = TrainingPipeline(args)
-    pipeline.train(resume=bool(args.resume))
+    # pipeline.train(resume=bool(args.resume))
     pipeline.test()
 
 

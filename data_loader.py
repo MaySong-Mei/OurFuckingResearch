@@ -147,13 +147,13 @@ class MedicalVolumeDataset(Dataset):
 
     def _extract_slices(self, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Extract slices from volume for I3Net (4 input -> 7 output):
-        1. Sampled slices: 4 slices sampled from volume
-        2. Ground truth slices: 7 consecutive slices (4*2-1)
+        Extract slices from volume:
+        1. Sampled slices: 4 slices sampled from volume (for I3Net input)
+        2. Ground truth slices: All slices from the volume
 
         Returns:
             slices: [4, H, W] - 4 sampled slices
-            ground_truth_slices: [7, H, W] - 7 ground truth slices
+            ground_truth_slices: [Z, H, W] - All ground truth slices
         """
         volume = volume.transpose(2, 0, 1) # [H, W, D] -> [D, H, W]
         # Downsampling
@@ -164,8 +164,8 @@ class MedicalVolumeDataset(Dataset):
 
         sampled_slices = volume[indices]  # [4, H, W]
 
-
-        ground_truth_slices = volume[:7]  # 7 consecutive slices
+        # Use all slices as ground truth
+        ground_truth_slices = volume  # [Z, H, W] - all slices
 
         # Normalize intensities
         sampled_slices = self._normalize_intensity(sampled_slices)
